@@ -1,0 +1,69 @@
+name: Scrape Finviz Earnings
+
+# Runs automatically every 6 hours (4x/day), chaining through the day via
+# the resumable progress cursor built into finviz_earnings_scraper.py —
+# each run picks up wherever the last one left off (see ScraperProgress
+# in the sheet), so together they cover the full ~5,336-ticker universe
+# without ever needing more than one run writing at a time. Also
+# runnable by hand any time from the Actions tab, optionally limited to
+# a small number of tickers for a quick test.
+on:
+  schedule:
+    - cron: '0 0,6,12,18 * * *'  # 00:00, 06:00, 12:00, 18:00 UTC
+  workflow_dispatch:
+    inputs:
+      tickers_limit:
+        description: 'Optional: only process the first N tickers of today''s remaining list (for a quick test run). Leave blank for a full run.'
+        required: false
+        default: ''
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    # Stops cleanly a bit before GitHub's hard 360-minute cap per job.
+    # Even if a run gets cut off here, nothing is lost beyond the last
+    # unfinished 20-ticker batch — see the checkpointing/resume logic in
+    # the script itself.
+    timeout-minutes: 340
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Set up Chrome (for Selenium)
+        uses: browser-actions/setup-chrome@v1
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scraper
+        env:
+          # --- Secrets: real values live in GitHub Settings > Secrets,
+          # never in this file or anywhere in the repo's code/history. ---
+          FINVIZ_WEB_APP_URL: ${{ secrets.FINVIZ_WEB_APP_URL }}
+          FINVIZ_TICKERS_SPREADSHEET_ID: ${{ secrets.FINVIZ_TICKERS_SPREADSHEET_ID }}
+
+          # --- Plain config: not sensitive, safe to keep visible here. ---
+          FINVIZ_TICKERS_FROM_SHEET: "true"
+          FINVIZ_TICKERS_SHEET_NAME: "Raw_Universe"
+          FINVIZ_TICKERS_COLUMN: "Ticker"
+
+          # Only set when this workflow was triggered manually with a
+          # value typed into the "tickers_limit" box above — empty for
+          # every scheduled (cron) run, which correctly means "no limit,
+          # full run" (see FINVIZ_TICKERS_LIMIT in env.example).
+          FINVIZ_TICKERS_LIMIT: ${{ github.event.inputs.tickers_limit }}
+        run: python finviz_earnings_scraper.py
+
+      - name: Upload local CSV preview as a downloadable artifact
+        if: always()  # still useful to see even if the run partially failed
+        uses: actions/upload-artifact@v4
+        with:
+          name: scraped-data-run-${{ github.run_number }}
+          path: scraped_data/
+          retention-days: 14

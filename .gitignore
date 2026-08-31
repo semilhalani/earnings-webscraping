@@ -1,0 +1,9 @@
+# Never commit your real config — only .env.example (the template) is safe to commit.
+.env
+
+# Local scrape output / test artifacts — these are working files, not source.
+scraped_data/
+test_output/
+__pycache__/
+*.pyc
+.venv/
