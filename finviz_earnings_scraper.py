@@ -963,7 +963,7 @@ def write_via_webapp(
         payload["mode"] = mode
     if clear_before_write:
         payload["clear_before_write"] = True
-    resp = requests.post(web_app_url, json=payload, timeout=30)
+    resp = requests.post(web_app_url, json=payload, timeout=180)
     resp.raise_for_status()
     result = resp.json()
     if not result.get("ok"):
