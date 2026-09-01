@@ -928,6 +928,10 @@ def write_via_webapp(
     key_columns: Optional[List[str]] = None,
     mode: Optional[str] = None,
     clear_before_write: bool = False,
+    action: Optional[str] = None,
+    timeout: Optional[float] = None,
+    retries: int = 2,
+    retry_delay: float = 5.0,
 ) -> Dict:
     """
     Alternative to upsert_rows() — sends rows to an Apps Script Web App
@@ -946,11 +950,47 @@ def write_via_webapp(
 
     clear_before_write=True wipes all existing data rows in the target
     sheet (header kept) before applying `rows` — used only once, at the
-    start of a fresh day's --tickers-from-sheet sweep, to reset
+    start of a fresh --tickers-from-sheet sweep, to reset
     Raw_ScrapeIssues so it reflects only today's failures, not an
     ever-growing history mixing in issues already fixed days ago.
+
+    TIMEOUT/RETRIES — this used to be a plain, unprotected `timeout=30`
+    HTTP call with no retry, and the checkpoint calls that use it (see
+    flush() in run_batch) had no try/except around them either. That
+    combination caused a real failure in production: a 20-ticker GitHub
+    Actions test run failed after ~14 minutes because ONE write to the
+    Apps Script Web App took longer than 30s and crashed the entire run
+    — confirmed by raising the timeout to 180s, which then succeeded.
+
+    Apps Script genuinely can be slower than a normal API call: the
+    LockService added for write-safety (see finviz_data_receiver.gs)
+    can briefly queue a caller behind another write, and sortSheet_()
+    re-sorts the WHOLE sheet after every single write, which gets slower
+    as a sheet grows into the thousands of rows this project produces.
+    A fixed 30s budget for all of that was never generous enough.
+
+    The real fix isn't just a bigger number, though — a single slow
+    call, however rare, could still exceed any fixed timeout and take
+    the whole run down with it, discarding a checkpoint's worth of
+    already-scraped data along with it. So this now ALSO retries on
+    failure (timeout, connection error, or a non-2xx response) before
+    giving up, the same defensive pattern fetch_html_with_retry() uses
+    for the scraping side. A truly broken Web App URL still surfaces as
+    a real, loud error after retries are exhausted — this is deliberate
+    for the four core data tables, where a persistent inability to save
+    should stop the run rather than silently scraping data that can
+    never be saved; see the try/except wrapping in flush() for how
+    progress/issues tracking (non-critical metadata) differ, degrading
+    gracefully instead.
+
+    timeout defaults to FINVIZ_WEBAPP_TIMEOUT (120s) if not given —
+    override per-call, or set that env var, if your sheets grow large
+    enough that even 120s stops being enough headroom.
     """
     import requests
+
+    if timeout is None:
+        timeout = _env_float("FINVIZ_WEBAPP_TIMEOUT", 120.0)
 
     payload = {
         "sheet": sheet_name,
@@ -963,12 +1003,29 @@ def write_via_webapp(
         payload["mode"] = mode
     if clear_before_write:
         payload["clear_before_write"] = True
-    resp = requests.post(web_app_url, json=payload, timeout=180)
-    resp.raise_for_status()
-    result = resp.json()
-    if not result.get("ok"):
-        raise RuntimeError(f"Web App reported an error: {result.get('error')}")
-    return result
+    if action:
+        # Overrides the whole payload with just the action — used only by
+        # trigger_sort_via_webapp() to send {"action": "sort_all"}, which
+        # doesn't need sheet/headers/rows at all. Reuses this function's
+        # retry/timeout handling rather than duplicating it.
+        payload = {"action": action}
+
+    last_error: Optional[Exception] = None
+    for attempt in range(retries + 1):
+        try:
+            resp = requests.post(web_app_url, json=payload, timeout=timeout)
+            resp.raise_for_status()
+            result = resp.json()
+            if not result.get("ok"):
+                raise RuntimeError(f"Web App reported an error: {result.get('error')}")
+            return result
+        except Exception as e:
+            last_error = e
+            if attempt < retries:
+                print(f"  Write to {sheet_name!r} failed (attempt {attempt + 1}/{retries + 1}): "
+                      f"{e} — retrying in {retry_delay}s...")
+                time.sleep(retry_delay)
+    raise last_error
 
 
 def fetch_tickers_from_sheet(
@@ -1101,16 +1158,19 @@ def write_issues_via_webapp(
     somewhere visible without needing the console log.
 
     clear_first=True wipes the sheet before writing — pass this ONLY on
-    the very first write of a fresh day's full sweep (resume_offset==0),
-    so the sheet reflects today's issues only, not an ever-growing mix of
-    old ones already fixed and new ones. Later checkpoints in the SAME
-    day's sweep should pass clear_first=False so they add to, rather
-    than wipe, what this run has already found today.
+    the very first write of a fresh full sweep (resume_offset==0). Note
+    "fresh" means "the previous sweep just completed or never existed,"
+    not "a new calendar day started" — a sweep may now legitimately span
+    several days if scraping is slow (see resolve_resume_start()), so
+    this sheet reflects the CURRENT sweep's issues only, not an
+    ever-growing mix of old ones already fixed and new ones. Later
+    checkpoints within the same sweep should pass clear_first=False so
+    they add to, rather than wipe, what this sweep has found so far.
 
     Plain append (finalize_column=None), same pattern as
-    Raw_PostEarningsMoves — a ticker shouldn't be scraped twice in one
-    day's sweep (resume slicing guarantees each index is only visited
-    once), so key collisions within a single day aren't expected.
+    Raw_PostEarningsMoves — a ticker shouldn't be scraped twice within
+    one sweep (resume slicing guarantees each index is only visited
+    once per sweep), so key collisions aren't expected here.
     """
     if not issues and not clear_first:
         return
@@ -1132,30 +1192,70 @@ def write_issues_via_webapp(
     )
 
 
-def resolve_resume_start(progress: Optional[Dict], today: str, total_tickers: int) -> int:
+def trigger_sort_via_webapp(web_app_url: str) -> None:
     """
-    Pure function (easy to test) implementing the actual resume rule:
-    - No progress recorded yet -> start at 0.
-    - Progress recorded, but for a DIFFERENT (earlier) date -> a new day
-      has started; start at 0 (today gets its own fresh full sweep, since
-      analyst estimates can change even for tickers with no new earnings
-      report — see chat discussion for why a full daily sweep matters
-      here, not just an earnings-calendar-filtered subset).
-    - Progress recorded for TODAY, next_index < total_tickers -> resume
-      from next_index (the actual point of this whole feature).
-    - Progress recorded for TODAY, next_index >= total_tickers -> today's
-      sweep already finished; nothing left to do (returns total_tickers,
-      so the caller ends up with an empty ticker list and a clean no-op).
+    Asks the Apps Script Web App to sort the four main data sheets, once
+    — see sortAllDataSheets() in finviz_data_receiver.gs. Called once at
+    the end of a real (non-dry-run) run_batch() run, replacing the old
+    design where every single checkpoint write triggered its own
+    full-sheet sort (267+ times per full sweep — confirmed in production
+    to be slow enough, as sheets grew, to cause an HTTP timeout that
+    crashed an entire run). Sorting once per script run is a deliberate
+    middle ground: far less frequent than "every write" (the original
+    bug), and — importantly — doesn't depend on a separately-configured
+    time-driven trigger living outside version control that could be
+    silently deleted with nothing to signal it's gone. Every run that
+    reaches this point re-sorts, with no extra setup required.
+
+    Uses write_via_webapp()'s own retry/timeout handling for free. If
+    sorting fails even after retries, this only prints a warning — it
+    never fails the run, since sort order is purely cosmetic and has no
+    effect on the correctness of any data already safely written.
+    """
+    try:
+        write_via_webapp(web_app_url, sheet_name="sort_all", headers=[], rows=[], action="sort_all")
+    except Exception as e:
+        print(f"  WARNING: could not sort sheets at end of run ({e}). "
+              f"Data is unaffected — this is purely cosmetic and will be retried on the next run.")
+
+
+def resolve_resume_start(progress: Optional[Dict], total_tickers: int) -> int:
+    """
+    Pure function (easy to test) implementing the actual resume rule.
+
+    IMPORTANT — this used to reset to 0 whenever the calendar date had
+    changed since the last recorded progress, regardless of whether that
+    sweep had actually finished. That was a real, serious bug once a
+    sweep turned out to genuinely take longer than a single day (confirmed
+    in production: ~45s/ticker in GitHub Actions vs. ~8-13s/ticker
+    locally meant one sweep would need ~2.8 days, not hours). With the
+    old date-based rule, that meant progress got silently discarded and
+    restarted from ticker 1 every single midnight, FOREVER — tickers
+    past whatever a day's runs could reach would never be scraped, not
+    once, permanently.
+
+    The rule now: resume from wherever next_index says, for as many days
+    as that takes, and only start a FRESH sweep once next_index actually
+    reaches total_tickers — i.e. the previous sweep genuinely completed.
+    The calendar date is no longer part of this decision at all; it's
+    kept in the progress row purely for a human to see how long the
+    current sweep has been running, not to drive any logic.
+
+    - No progress recorded yet -> start at 0 (first run ever).
+    - next_index < total_tickers -> resume from next_index, no matter how
+      many days ago that was recorded — the sweep is still in progress.
+    - next_index >= total_tickers -> the last sweep finished; start a
+      fresh one from 0.
     """
     if not progress:
-        return 0
-    if str(progress.get("run_date")) != today:
         return 0
     try:
         next_index = int(progress.get("next_index", 0))
     except (TypeError, ValueError):
         return 0
-    return max(0, min(next_index, total_tickers))
+    if next_index >= total_tickers:
+        return 0  # previous sweep genuinely complete -> start a fresh one
+    return max(0, next_index)
 
 
 # ---------------------------------------------------------------------------
@@ -1413,62 +1513,75 @@ def run_batch(
 
         batch_eps, batch_gaap_eps, batch_revenue, batch_price = [], [], [], []
 
-    for i, ticker in enumerate(tickers):
-        print(f"[{i + 1}/{len(tickers)}] Scraping {ticker}...")
-        try:
-            data = scrape_ticker(ticker, headless=headless)
-            batch_eps.extend(data["eps"])
-            batch_gaap_eps.extend(data["gaap_eps"])
-            batch_revenue.extend(data["revenue"])
-            batch_price.extend(data["price_reaction"])
-            ok_count += 1
-            print(
-                f"  OK: {len(data['eps'])} EPS, {len(data['gaap_eps'])} GAAP EPS, "
-                f"{len(data['revenue'])} Revenue, {len(data['price_reaction'])} PriceReaction quarters"
-            )
-        except NoFinancialsDataError as e:
-            no_data_count += 1
-            batch_issues.append((ticker, "NO_DATA", str(e)))
-            print(f"  NO DATA (expected for ETFs/unlisted tickers): {e}")
-        except Exception as e:
-            failed_tickers.append(ticker)
-            batch_issues.append((ticker, "FAILED", str(e)))
-            print(f"  FAILED (worth investigating): {e}")
+    def _run_scrape_loop():
+        nonlocal ok_count, no_data_count, batch_issues
+        for i, ticker in enumerate(tickers):
+            print(f"[{i + 1}/{len(tickers)}] Scraping {ticker}...")
+            ticker_started = time.monotonic()
+            try:
+                data = scrape_ticker(ticker, headless=headless)
+                elapsed = time.monotonic() - ticker_started
+                batch_eps.extend(data["eps"])
+                batch_gaap_eps.extend(data["gaap_eps"])
+                batch_revenue.extend(data["revenue"])
+                batch_price.extend(data["price_reaction"])
+                ok_count += 1
+                print(
+                    f"  OK ({elapsed:.1f}s): {len(data['eps'])} EPS, {len(data['gaap_eps'])} GAAP EPS, "
+                    f"{len(data['revenue'])} Revenue, {len(data['price_reaction'])} PriceReaction quarters"
+                )
+            except NoFinancialsDataError as e:
+                elapsed = time.monotonic() - ticker_started
+                no_data_count += 1
+                batch_issues.append((ticker, "NO_DATA", str(e)))
+                print(f"  NO DATA ({elapsed:.1f}s, expected for ETFs/unlisted tickers): {e}")
+            except Exception as e:
+                elapsed = time.monotonic() - ticker_started
+                failed_tickers.append(ticker)
+                batch_issues.append((ticker, "FAILED", str(e)))
+                print(f"  FAILED ({elapsed:.1f}s, worth investigating): {e}")
 
-        is_last = i == len(tickers) - 1
-        if (i + 1) % batch_size == 0 or is_last:
-            flush(f"after {i + 1}/{len(tickers)} tickers")
+            is_last = i == len(tickers) - 1
+            if (i + 1) % batch_size == 0 or is_last:
+                flush(f"after {i + 1}/{len(tickers)} tickers")
 
-            if track_progress:
-                absolute_next_index = resume_offset + (i + 1)
-                try:
-                    write_progress_via_webapp(
-                        web_app_url, absolute_next_index, total_universe, run_date, ticker,
-                        sheet_name=progress_sheet_name,
-                    )
-                    print(f"  Progress saved: {absolute_next_index}/{total_universe} tickers done today "
-                          f"(last: {ticker}).")
-                except Exception as e:
-                    # Never let a progress-tracking hiccup take down an
-                    # otherwise-successful run — the actual data is
-                    # already safely written above; worst case here is
-                    # just that the NEXT run doesn't know to resume and
-                    # re-scrapes from the top, which is wasteful but not
-                    # harmful (the upsert logic is safe to repeat).
-                    print(f"  WARNING: could not save progress cursor ({e}). "
-                          f"Data above this line is still safe; next run may restart from the top.")
-
-                if batch_issues:
+                if track_progress:
+                    absolute_next_index = resume_offset + (i + 1)
                     try:
-                        write_issues_via_webapp(web_app_url, batch_issues, run_date, clear_first=False)
-                        print(f"  {ISSUES_SHEET_NAME}: recorded {len(batch_issues)} issue(s) from this batch.")
+                        write_progress_via_webapp(
+                            web_app_url, absolute_next_index, total_universe, run_date, ticker,
+                            sheet_name=progress_sheet_name,
+                        )
+                        print(f"  Progress saved: {absolute_next_index}/{total_universe} tickers done today "
+                              f"(last: {ticker}).")
                     except Exception as e:
-                        print(f"  WARNING: could not save scrape issues ({e}). "
-                              f"They're still visible in this console output above.")
-                    batch_issues = []
+                        # Never let a progress-tracking hiccup take down an
+                        # otherwise-successful run — the actual data is
+                        # already safely written above; worst case here is
+                        # just that the NEXT run doesn't know to resume and
+                        # re-scrapes from the top, which is wasteful but not
+                        # harmful (the upsert logic is safe to repeat).
+                        print(f"  WARNING: could not save progress cursor ({e}). "
+                              f"Data above this line is still safe; next run may restart from the top.")
 
-        if not is_last:
-            time.sleep(delay)
+                    if batch_issues:
+                        try:
+                            write_issues_via_webapp(web_app_url, batch_issues, run_date, clear_first=False)
+                            print(f"  {ISSUES_SHEET_NAME}: recorded {len(batch_issues)} issue(s) from this batch.")
+                        except Exception as e:
+                            print(f"  WARNING: could not save scrape issues ({e}). "
+                                  f"They're still visible in this console output above.")
+                        batch_issues = []
+
+            if not is_last:
+                time.sleep(delay)
+
+    try:
+        _run_scrape_loop()
+    finally:
+        if use_webapp and not dry_run:
+            print("\nSorting sheets once at the end of this run...")
+            trigger_sort_via_webapp(web_app_url)
 
     print(
         f"\n{ok_count} OK, {no_data_count} NO_DATA, {len(failed_tickers)} FAILED"
@@ -1594,7 +1707,7 @@ if __name__ == "__main__":
         default=_env_bool("FINVIZ_RESUME", True),
         help="Only relevant with --tickers-from-sheet: pick up from today's saved progress cursor "
         "(ScraperProgress sheet) instead of starting at ticker 1. On by default. Use --no-resume to "
-        "force starting today's sweep over from the beginning regardless of what's saved. "
+        "force starting the current sweep over from the beginning regardless of what's saved. "
         "Env var: FINVIZ_RESUME (true/false).",
     )
     parser.add_argument(
@@ -1646,10 +1759,13 @@ if __name__ == "__main__":
                 spreadsheet_id=args.tickers_spreadsheet_id,
             )
             total_universe = len(full_tickers)
-            # UTC, not local time — so "today" means the same calendar
-            # day whether this runs on your Mac or on a GitHub Actions
-            # runner (which is always UTC), keeping the cursor consistent
-            # across environments.
+            # UTC, not local time — used only as a "when did this happen"
+            # label written to ScraperProgress/Raw_ScrapeIssues, purely
+            # for a human to read. Does NOT drive the resume decision —
+            # see resolve_resume_start() for why a sweep now correctly
+            # continues across day boundaries however long it takes,
+            # instead of restarting every midnight regardless of whether
+            # the previous sweep actually finished.
             run_date = datetime.now(timezone.utc).date().isoformat()
 
             if args.resume:
@@ -1660,19 +1776,19 @@ if __name__ == "__main__":
                 except Exception as e:
                     print(f"Could not fetch progress cursor ({e}) — starting from the top as a fallback.")
                     progress = None
-                resume_offset = resolve_resume_start(progress, run_date, total_universe)
+                resume_offset = resolve_resume_start(progress, total_universe)
             else:
-                print("--no-resume: ignoring any saved progress, starting today's sweep from the top.")
+                print("--no-resume: ignoring any saved progress, starting a fresh sweep from the top.")
 
             tickers = full_tickers[resume_offset:]
 
             if resume_offset > 0:
-                print(f"Resuming today's sweep from ticker {resume_offset + 1}/{total_universe} "
-                      f"({resume_offset} already done today).")
+                print(f"Resuming the in-progress sweep from ticker {resume_offset + 1}/{total_universe} "
+                      f"({resume_offset} done so far this sweep).")
             elif resume_offset >= total_universe:
-                print(f"Today's full sweep ({total_universe} tickers) is already complete — nothing to do.")
+                print(f"The current sweep ({total_universe} tickers) is already complete — nothing to do.")
             else:
-                print(f"Starting a fresh sweep of all {total_universe} tickers for {run_date}.")
+                print(f"Starting a fresh sweep of all {total_universe} tickers (started {run_date}).")
         else:
             tickers = args.tickers
 
