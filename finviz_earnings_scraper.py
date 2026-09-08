@@ -1277,6 +1277,68 @@ def resolve_resume_start(progress: Optional[Dict], total_tickers: int) -> int:
 # Test functions — ALWAYS run these before scaling to thousands of tickers
 # ---------------------------------------------------------------------------
 
+def test_baseline_speed(headless: bool = True, rounds: int = 3) -> None:
+    """
+    Diagnostic — NOT part of the normal scraping flow. Times loading a
+    known-fast, completely unrelated site (example.com — a static,
+    trivial page with no ads/tracking/JS of its own) using the EXACT
+    SAME Selenium/Chrome setup (get_driver) as real scraping, then
+    prints a comparison against what a real Finviz scrape just measured.
+
+    WHY THIS EXISTS: a run on 2026-09-08 showed 15 of 16 tickers taking
+    24-38s each, apparently in isolation (no confirmed overlapping run).
+    That's consistent with two very different root causes that look
+    identical from the outside:
+      1. Finviz-side — the site itself responds slowly or throttles
+         requests from GitHub's cloud IP ranges, regardless of load.
+      2. Runner-side — GitHub's free shared runners can have variable,
+         sometimes-throttled CPU, making Chrome itself sluggish,
+         independent of which site it's loading.
+    These call for different fixes, and matter a lot for whether
+    parallelism would even help (matrix jobs get separate dedicated
+    VMs, so runner-CPU throttling would improve with parallelism;
+    Finviz-side throttling might not, or could get worse).
+
+    This test answers that cheaply: if example.com ALSO takes 20-30s+
+    on this runner, the problem is generic (Chrome/runner), not Finviz.
+    If example.com loads in ~1-2s while Finviz tickers take 30s, that
+    points specifically at Finviz's own behavior toward this traffic.
+    """
+    print(f"=== Baseline speed test: {rounds} loads of example.com (unrelated to Finviz) ===\n")
+    times = []
+    for i in range(rounds):
+        driver = get_driver(headless=headless)
+        try:
+            started = time.monotonic()
+            driver.get("https://example.com")
+            # No widget to wait for here — example.com has no dynamic
+            # content, so page load completion IS the whole measurement.
+            elapsed = time.monotonic() - started
+            times.append(elapsed)
+            print(f"  Round {i + 1}/{rounds}: {elapsed:.1f}s")
+        finally:
+            driver.quit()
+        if i < rounds - 1:
+            time.sleep(1)
+
+    avg = sum(times) / len(times)
+    print(f"\nAverage: {avg:.1f}s across {rounds} loads of a trivial, unrelated page.")
+    print()
+    if avg > 10:
+        print("SLOW even for a trivial unrelated site — this points at something")
+        print("generic to this Chrome/runner setup, NOT specifically Finviz.")
+        print("Parallelism (separate runner VMs per matrix job) would likely help,")
+        print("since each job gets its own dedicated resources.")
+    else:
+        print("FAST for a trivial unrelated site — Chrome and the runner itself")
+        print("are working normally. If real Finviz scrapes are still slow, that")
+        print("points specifically at Finviz's own behavior toward this traffic")
+        print("(rate-limiting, or generally slower responses for this source),")
+        print("not a generic infrastructure problem. Parallelism might not help,")
+        print("or could make it worse, if that throttling responds to aggregate")
+        print("request rate rather than which runner/VM sent the request.")
+
+
 def test_single_ticker(ticker: str = "LUNR", output_dir: str = "test_output") -> Optional[Dict[str, List[Dict]]]:
     """Scrapes ONE ticker, prints full results, writes a local CSV preview
     for you to open and check — no Sheets write. Runs with a visible
@@ -1668,6 +1730,12 @@ if __name__ == "__main__":
         "Deliberately NOT env-configurable — see note above main().",
     )
     parser.add_argument(
+        "--test-baseline", action="store_true",
+        help="Diagnostic: time loading a trivial unrelated site (example.com) with the same "
+        "Chrome setup, to tell generic runner/Chrome slowness apart from Finviz-specific "
+        "slowness. No Sheets write, no real scraping. See test_baseline_speed().",
+    )
+    parser.add_argument(
         "--web-app-url",
         default=os.environ.get("FINVIZ_WEB_APP_URL"),
         help="Apps Script Web App URL — simplest option, no Cloud Console. Env var: FINVIZ_WEB_APP_URL",
@@ -1758,6 +1826,8 @@ if __name__ == "__main__":
         test_single_ticker(args.tickers[0] if args.tickers else "LUNR", **output_kwargs)
     elif args.test_batch:
         test_small_batch(args.tickers or None, delay=args.delay, **output_kwargs)
+    elif args.test_baseline:
+        test_baseline_speed(headless=not args.show)
     else:
         resume_offset = 0
         total_universe: Optional[int] = None
