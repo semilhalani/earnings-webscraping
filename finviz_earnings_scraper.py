@@ -1084,7 +1084,16 @@ def fetch_tickers_from_sheet(
 # since nothing it does is actually saved.
 # ---------------------------------------------------------------------------
 
-PROGRESS_HEADERS = ["run_date", "next_index", "total_tickers", "last_ticker", "last_updated"]
+PROGRESS_HEADERS = ["row_id", "run_date", "next_index", "total_tickers", "last_ticker", "last_updated"]
+# row_id is ALWAYS the literal string "current" — see write_progress_via_webapp
+# for why this exists: run_date was originally used as the key, but Google
+# Sheets auto-detects date-looking strings and silently stores them as a
+# real Date object, which then fails to string-match the plain string sent
+# on the NEXT write. Every write believed the key was new and appended a
+# fresh row instead of updating the existing one — confirmed in production:
+# dozens of rows accumulated for the same date instead of one row that
+# advances. A fixed, never-date-like sentinel value sidesteps the whole
+# type-conversion problem rather than trying to work around it.
 ISSUES_SHEET_NAME = "Raw_ScrapeIssues"
 ISSUES_HEADERS = ["ticker", "status", "detail", "run_date", "last_updated"]
 
@@ -1126,12 +1135,18 @@ def write_progress_via_webapp(
     this update the SAME row every checkpoint instead of the normal
     once-and-frozen upsert behavior every other table uses.
 
+    Keyed on the constant row_id="current", NOT run_date — see the
+    PROGRESS_HEADERS comment above for why: run_date being auto-converted
+    to a Date object by Sheets broke key-matching on every write, causing
+    silent duplicate rows instead of one row that actually advances.
+
     last_ticker is the actual symbol most recently processed (i.e. the
     ticker at position next_index - 1) — purely for a human reading the
     sheet, so "next_index: 2000" doesn't require cross-referencing
     Raw_Universe to know what that number means. Not used by the resume
     logic itself, which only ever reads next_index."""
     row = {
+        "row_id": "current",
         "run_date": run_date,
         "next_index": next_index,
         "total_tickers": total_tickers,
@@ -1140,7 +1155,7 @@ def write_progress_via_webapp(
     }
     write_via_webapp(
         web_app_url, sheet_name, PROGRESS_HEADERS, [row],
-        key_columns=["run_date"], mode="overwrite",
+        key_columns=["row_id"], mode="overwrite",
     )
 
 
