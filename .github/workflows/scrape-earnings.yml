@@ -17,6 +17,30 @@ on:
         required: false
         default: ''
 
+# CRITICAL — without this, a manual run and a scheduled run (or two
+# scheduled runs back to back, if one overruns its window) can start at
+# the same time and both hit Finviz simultaneously, roughly doubling the
+# effective request rate against the same site from the same handful of
+# IPs — confirmed in production to trigger exactly the kind of
+# progressive slowdown that eventually escalates into outright renderer
+# timeouts. It also means both runs read the SAME progress cursor at
+# their own start time and re-scrape overlapping tickers, wasting
+# Actions minutes for zero net progress, and risks a race where whichever
+# run's checkpoint writes last overwrites a further-ahead run's progress
+# with a stale value.
+#
+# This group applies across BOTH trigger types (schedule AND
+# workflow_dispatch) — a static group name, not one keyed to the
+# specific trigger, is what makes "a manual run and a scheduled run
+# collide" impossible, not just "two scheduled runs collide."
+# cancel-in-progress: false means a new trigger QUEUES behind whatever's
+# currently running rather than killing it — the current run either
+# finishes naturally or hits its own timeout-minutes cutoff, then the
+# queued one starts. Nothing is ever running two-at-a-time.
+concurrency:
+  group: scrape-finviz-earnings
+  cancel-in-progress: false
+
 jobs:
   scrape:
     runs-on: ubuntu-latest
