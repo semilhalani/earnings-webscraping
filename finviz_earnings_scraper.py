@@ -930,7 +930,7 @@ def write_via_webapp(
     clear_before_write: bool = False,
     action: Optional[str] = None,
     timeout: Optional[float] = None,
-    retries: int = 2,
+    retries: int = 4,
     retry_delay: float = 5.0,
 ) -> Dict:
     """
@@ -1022,9 +1022,21 @@ def write_via_webapp(
         except Exception as e:
             last_error = e
             if attempt < retries:
+                # Escalating backoff, not a flat 5s. The failures seen in
+                # production are Apps Script's own redirect target going
+                # bad — a 404 on the script.googleusercontent.com
+                # /macros/echo URL, or that URL being answered by doGet
+                # instead of the cached doPost result (which surfaces as
+                # the confusing "Sheet not found: Tickers", since
+                # 'Tickers' is doGet's default sheet name). Both are
+                # transient Google-side glitches, but three attempts
+                # crammed into ~10 seconds can easily all land inside the
+                # same bad window. Backing off further gives it room to
+                # recover: 5s, 15s, 30s, 60s.
+                delay = retry_delay * (1, 3, 6, 12)[min(attempt, 3)]
                 print(f"  Write to {sheet_name!r} failed (attempt {attempt + 1}/{retries + 1}): "
-                      f"{e} — retrying in {retry_delay}s...")
-                time.sleep(retry_delay)
+                      f"{e} — retrying in {delay:.0f}s...")
+                time.sleep(delay)
     raise last_error
 
 
@@ -1277,66 +1289,195 @@ def resolve_resume_start(progress: Optional[Dict], total_tickers: int) -> int:
 # Test functions — ALWAYS run these before scaling to thousands of tickers
 # ---------------------------------------------------------------------------
 
-def test_baseline_speed(headless: bool = True, rounds: int = 3) -> None:
+def _timed_page_load(
+    url: str,
+    headless: bool,
+    wait_selector: Optional[str] = None,
+    wait_timeout: int = 15,
+) -> Dict[str, object]:
     """
-    Diagnostic — NOT part of the normal scraping flow. Times loading a
-    known-fast, completely unrelated site (example.com — a static,
-    trivial page with no ads/tracking/JS of its own) using the EXACT
-    SAME Selenium/Chrome setup (get_driver) as real scraping, then
-    prints a comparison against what a real Finviz scrape just measured.
+    Helper for test_baseline_speed(). Loads ONE url using the exact same
+    Chrome setup real scraping uses (get_driver), and reports the two
+    costs SEPARATELY:
+
+      - "launch": how long webdriver.Chrome() took to start a fresh
+        browser. This contacts no website at all, so it is very close to
+        a pure measurement of this machine's own CPU/disk speed. If THIS
+        is slow, the runner is throttled, and nothing done on the Finviz
+        side will fix it.
+      - "load": how long the page took once the browser was already up,
+        including (when wait_selector is given) waiting for that element
+        to render.
+
+    WHY SPLIT THEM: the first version of this diagnostic started its
+    timer AFTER the browser was already running, so launch cost was
+    invisible. That hid exactly the signal the test exists to find,
+    because CPU throttling shows up in browser startup more clearly than
+    anywhere else — and the scraper pays that startup cost once per
+    ticker, 5,336 times per sweep, not once per run.
+    """
+    launch_started = time.monotonic()
+    driver = get_driver(headless=headless)
+    launch = time.monotonic() - launch_started
+
+    ok = True
+    note = ""
+    load_started = time.monotonic()
+    try:
+        try:
+            driver.get(url)
+            if wait_selector:
+                WebDriverWait(driver, wait_timeout).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, wait_selector))
+                )
+        except TimeoutException:
+            ok = False
+            note = "timed out waiting for the page/widget"
+        except Exception as e:  # noqa: BLE001 — diagnostic: report, never crash the test
+            ok = False
+            note = f"{type(e).__name__}: {e}"
+        load = time.monotonic() - load_started
+    finally:
+        driver.quit()
+
+    return {"launch": launch, "load": load, "ok": ok, "note": note}
+
+
+def test_baseline_speed(
+    headless: bool = True,
+    rounds: int = 3,
+    finviz_ticker: str = "AAPL",
+) -> None:
+    """
+    Diagnostic — NOT part of the normal scraping flow. Writes nothing to
+    Sheets and scrapes no data.
 
     WHY THIS EXISTS: a run on 2026-09-08 showed 15 of 16 tickers taking
     24-38s each, apparently in isolation (no confirmed overlapping run).
-    That's consistent with two very different root causes that look
+    That is consistent with two very different root causes that look
     identical from the outside:
-      1. Finviz-side — the site itself responds slowly or throttles
-         requests from GitHub's cloud IP ranges, regardless of load.
+      1. Finviz-side — the site responds slowly to, or throttles,
+         requests coming from GitHub's cloud IP ranges.
       2. Runner-side — GitHub's free shared runners can have variable,
-         sometimes-throttled CPU, making Chrome itself sluggish,
-         independent of which site it's loading.
-    These call for different fixes, and matter a lot for whether
-    parallelism would even help (matrix jobs get separate dedicated
-    VMs, so runner-CPU throttling would improve with parallelism;
-    Finviz-side throttling might not, or could get worse).
+         sometimes-throttled CPU, making Chrome itself sluggish no
+         matter which site it loads.
+    These call for opposite fixes. Matrix parallelism gives each job its
+    own VM, so it would HELP cause 2 and could WORSEN cause 1.
 
-    This test answers that cheaply: if example.com ALSO takes 20-30s+
-    on this runner, the problem is generic (Chrome/runner), not Finviz.
-    If example.com loads in ~1-2s while Finviz tickers take 30s, that
-    points specifically at Finviz's own behavior toward this traffic.
+    HOW IT TELLS THEM APART: each round measures three things in the
+    same session, minutes apart at most, on the same machine:
+      - browser launch time (no network at all → pure local CPU),
+      - a trivial unrelated page, example.com (network, but a static
+        page nobody is throttling),
+      - one real Finviz ticker page, same wait logic as real scraping.
+
+    Measuring Finviz here, rather than comparing against numbers
+    remembered from an earlier run on another day, is the point: a
+    comparison is only trustworthy when both halves were taken under the
+    same conditions.
+
+    IMPORTANT — WHERE TO RUN THIS: the 24-38s slowness was observed on
+    GitHub Actions, and this project already knows local runs are fast
+    (~8-13s/ticker locally vs ~45s/ticker on Actions). So running this
+    locally cannot confirm or rule out runner throttling; it only tells
+    you your own machine is fine, which is already known. Run it on
+    Actions (Run workflow > diagnostic: baseline). A local run is still
+    worth having as a control, but it is not the deciding measurement.
     """
-    print(f"=== Baseline speed test: {rounds} loads of example.com (unrelated to Finviz) ===\n")
-    times = []
+    print("=== Baseline speed diagnostic ===")
+    print(f"Rounds: {rounds} | headless={headless} | Finviz ticker: {finviz_ticker}")
+    print("Nothing is written to Sheets; no earnings data is collected.\n")
+
+    launches: List[float] = []
+    example_loads: List[float] = []
+    finviz_loads: List[float] = []
+    finviz_failures = 0
+
     for i in range(rounds):
-        driver = get_driver(headless=headless)
-        try:
-            started = time.monotonic()
-            driver.get("https://example.com")
-            # No widget to wait for here — example.com has no dynamic
-            # content, so page load completion IS the whole measurement.
-            elapsed = time.monotonic() - started
-            times.append(elapsed)
-            print(f"  Round {i + 1}/{rounds}: {elapsed:.1f}s")
-        finally:
-            driver.quit()
+        print(f"--- Round {i + 1}/{rounds} ---")
+
+        ex = _timed_page_load("https://example.com", headless=headless)
+        launches.append(float(ex["launch"]))
+        if ex["ok"]:
+            example_loads.append(float(ex["load"]))
+            print(f"  example.com     launch {ex['launch']:.1f}s + load {ex['load']:.1f}s "
+                  f"= {float(ex['launch']) + float(ex['load']):.1f}s total")
+        else:
+            print(f"  example.com     launch {ex['launch']:.1f}s + FAILED after "
+                  f"{ex['load']:.1f}s — {ex['note']}")
+
+        fv = _timed_page_load(
+            build_url(finviz_ticker),
+            headless=headless,
+            wait_selector="div.js-financials-widget",
+        )
+        launches.append(float(fv["launch"]))
+        if fv["ok"]:
+            finviz_loads.append(float(fv["load"]))
+            print(f"  finviz {finviz_ticker:<8} launch {fv['launch']:.1f}s + load {fv['load']:.1f}s "
+                  f"= {float(fv['launch']) + float(fv['load']):.1f}s total")
+        else:
+            finviz_failures += 1
+            print(f"  finviz {finviz_ticker:<8} launch {fv['launch']:.1f}s + FAILED after "
+                  f"{fv['load']:.1f}s — {fv['note']}")
+
         if i < rounds - 1:
             time.sleep(1)
 
-    avg = sum(times) / len(times)
-    print(f"\nAverage: {avg:.1f}s across {rounds} loads of a trivial, unrelated page.")
-    print()
-    if avg > 10:
-        print("SLOW even for a trivial unrelated site — this points at something")
-        print("generic to this Chrome/runner setup, NOT specifically Finviz.")
-        print("Parallelism (separate runner VMs per matrix job) would likely help,")
-        print("since each job gets its own dedicated resources.")
+    def _avg(values: List[float]) -> Optional[float]:
+        return sum(values) / len(values) if values else None
+
+    launch_avg = _avg(launches)
+    example_avg = _avg(example_loads)
+    finviz_avg = _avg(finviz_loads)
+
+    def _fmt(label: str, value: Optional[float]) -> str:
+        return f"  {label:<34}{value:.1f}s" if value is not None else f"  {label:<34}(all attempts failed)"
+
+    print("\n=== Averages ===")
+    print(_fmt("Browser launch (no network):", launch_avg))
+    print(_fmt("example.com page load:", example_avg))
+    print(_fmt(f"Finviz {finviz_ticker} load + widget:", finviz_avg))
+    if finviz_failures:
+        print(f"  ({finviz_failures} of {rounds} Finviz attempts failed outright)")
+
+    if launch_avg is not None and example_avg is not None:
+        print(f"\n  Real per-ticker cost implied here: "
+              f"{launch_avg + (finviz_avg if finviz_avg is not None else 0):.1f}s "
+              f"(launch + Finviz load), before any parsing or Sheets write.")
+
+    print("\n=== Reading this ===")
+
+    if launch_avg is not None and launch_avg > 8:
+        print("BROWSER LAUNCH IS SLOW. Starting Chrome touches no website at all,")
+        print("so this is a machine problem, not a Finviz problem — this runner's")
+        print("CPU is throttled or contended. Matrix parallelism would likely help,")
+        print("since each matrix job gets its own dedicated VM rather than sharing")
+        print("one throttled machine. Note the scraper opens a fresh browser per")
+        print("ticker, so this cost is paid 5,336 times per sweep, not once.")
+    elif example_avg is not None and example_avg > 10:
+        print("LAUNCH IS FINE BUT A TRIVIAL PAGE IS SLOW. Chrome starts normally,")
+        print("yet a static page nobody throttles still crawls — that points at")
+        print("general network egress from this runner, not at Finviz specifically.")
+        print("Parallelism may help somewhat, but treat that as unproven.")
+    elif finviz_avg is not None and example_avg is not None and finviz_avg > example_avg * 5:
+        print("LAUNCH AND example.com ARE BOTH FINE; FINVIZ SPECIFICALLY IS SLOW.")
+        print("The machine and its network are healthy, so this is about how Finviz")
+        print("treats this traffic — rate limiting, or slower responses for this")
+        print("source. Parallelism might NOT help here, and could make it worse if")
+        print("the throttling responds to total request rate rather than to which")
+        print("VM sent the request. Prefer pacing, session reuse, or fewer fresh")
+        print("browsers before reaching for more parallel jobs.")
     else:
-        print("FAST for a trivial unrelated site — Chrome and the runner itself")
-        print("are working normally. If real Finviz scrapes are still slow, that")
-        print("points specifically at Finviz's own behavior toward this traffic")
-        print("(rate-limiting, or generally slower responses for this source),")
-        print("not a generic infrastructure problem. Parallelism might not help,")
-        print("or could make it worse, if that throttling responds to aggregate")
-        print("request rate rather than which runner/VM sent the request.")
+        print("NOTHING LOOKS SLOW IN THIS SAMPLE. Launch, a trivial page, and a real")
+        print("Finviz page all completed at reasonable speed. Either the earlier")
+        print("slowdown was intermittent, or it needs a longer/again-later sample to")
+        print("reproduce. Do not redesign the architecture on the strength of this —")
+        print("re-run at the time of day the slow runs actually happened.")
+
+    print("\nCaveat worth keeping: this is a small sample on one machine at one")
+    print("moment. Run it on GitHub Actions, ideally more than once, before")
+    print("treating the verdict as settled.")
 
 
 def test_single_ticker(ticker: str = "LUNR", output_dir: str = "test_output") -> Optional[Dict[str, List[Dict]]]:
@@ -1534,6 +1675,11 @@ def run_batch(
         "gaap_eps_appended": 0, "gaap_eps_updated": 0,
         "revenue_appended": 0, "revenue_updated": 0,
         "price_appended": 0, "price_updated": 0,
+        # Counts table writes that failed even after every retry. Not an
+        # error condition for the run as a whole — see flush() — but it
+        # must be surfaced at the end so a run that quietly lost several
+        # checkpoints is never mistaken for a clean one.
+        "failed_writes": 0,
     }
     ok_count = no_data_count = 0
     failed_tickers: List[str] = []
@@ -1556,21 +1702,42 @@ def run_batch(
 
         if not dry_run:
             if use_webapp:
-                r = write_via_webapp(web_app_url, "Raw_EPSHistory", EPS_HEADERS, batch_eps, finalize_column="reported")
-                totals["eps_appended"] += r["appended"]; totals["eps_updated"] += r["updated"]
-                print(f"  Raw_EPSHistory: +{r['appended']} new, {r['updated']} updated")
+                # Each of the four table writes is now individually
+                # guarded. Before this, ANY failure here — after retries
+                # were exhausted inside write_via_webapp — propagated
+                # straight out of flush() and killed the entire run.
+                # Confirmed in production: run #44 died at ticker 2 of
+                # 5,336 with exit code 1, on a transient 404 from Apps
+                # Script's own redirect target, throwing away the whole
+                # run over a glitch that had nothing to do with the data.
+                #
+                # Deliberate scope of this change: it does NOT silently
+                # pretend a failed write succeeded. The batch that failed
+                # is still safely in the local CSV artifact written a few
+                # lines above (uploaded by the workflow, retention 14
+                # days), the failure is printed loudly, and it is counted
+                # so the end-of-run summary states plainly how many
+                # checkpoint writes were lost. Rows missed this way are
+                # picked up on the next sweep anyway, because the upsert
+                # matches on ticker+quarter and unreported rows are never
+                # frozen. Losing one checkpoint's worth of re-derivable
+                # rows is strictly better than losing hours of scraping.
+                def _write_table(label, headers, rows_, appended_key, updated_key, finalize):
+                    try:
+                        r = write_via_webapp(web_app_url, label, headers, rows_, finalize_column=finalize)
+                    except Exception as e:
+                        totals["failed_writes"] += 1
+                        print(f"  WARNING: {label} write FAILED after all retries ({e}). "
+                              f"This checkpoint's rows are still in {output_dir}/ and will be "
+                              f"re-collected on the next sweep. Continuing the run.")
+                        return
+                    totals[appended_key] += r["appended"]; totals[updated_key] += r["updated"]
+                    print(f"  {label}: +{r['appended']} new, {r['updated']} updated")
 
-                r = write_via_webapp(web_app_url, "Raw_GAAPEPSHistory", GAAP_EPS_HEADERS, batch_gaap_eps, finalize_column="reported")
-                totals["gaap_eps_appended"] += r["appended"]; totals["gaap_eps_updated"] += r["updated"]
-                print(f"  Raw_GAAPEPSHistory: +{r['appended']} new, {r['updated']} updated")
-
-                r = write_via_webapp(web_app_url, "Raw_RevenueHistory", REVENUE_HEADERS, batch_revenue, finalize_column="reported")
-                totals["revenue_appended"] += r["appended"]; totals["revenue_updated"] += r["updated"]
-                print(f"  Raw_RevenueHistory: +{r['appended']} new, {r['updated']} updated")
-
-                r = write_via_webapp(web_app_url, "Raw_PostEarningsMoves", PRICE_HEADERS, batch_price, finalize_column=None)
-                totals["price_appended"] += r["appended"]; totals["price_updated"] += r["updated"]
-                print(f"  Raw_PostEarningsMoves: +{r['appended']} new, {r['updated']} updated")
+                _write_table("Raw_EPSHistory", EPS_HEADERS, batch_eps, "eps_appended", "eps_updated", "reported")
+                _write_table("Raw_GAAPEPSHistory", GAAP_EPS_HEADERS, batch_gaap_eps, "gaap_eps_appended", "gaap_eps_updated", "reported")
+                _write_table("Raw_RevenueHistory", REVENUE_HEADERS, batch_revenue, "revenue_appended", "revenue_updated", "reported")
+                _write_table("Raw_PostEarningsMoves", PRICE_HEADERS, batch_price, "price_appended", "price_updated", None)
             else:
                 appended, updated = upsert_rows(eps_ws, batch_eps, finalize_column="reported")
                 totals["eps_appended"] += appended; totals["eps_updated"] += updated
@@ -1675,6 +1842,13 @@ def run_batch(
             f"Revenue: +{totals['revenue_appended']} new/{totals['revenue_updated']} updated, "
             f"PriceReaction: +{totals['price_appended']} new/{totals['price_updated']} updated"
         )
+        if totals["failed_writes"]:
+            print(
+                f"WARNING: {totals['failed_writes']} table write(s) failed after all retries during "
+                f"this run. Those rows are in {output_dir}/ (uploaded as a workflow artifact) and "
+                f"will be re-collected on the next sweep. If this number is consistently high, the "
+                f"Apps Script Web App — not the scraping — is the thing to look at."
+            )
 
     return {
         "ok_count": ok_count,
@@ -1731,9 +1905,11 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--test-baseline", action="store_true",
-        help="Diagnostic: time loading a trivial unrelated site (example.com) with the same "
-        "Chrome setup, to tell generic runner/Chrome slowness apart from Finviz-specific "
-        "slowness. No Sheets write, no real scraping. See test_baseline_speed().",
+        help="Diagnostic: separately times browser launch, a trivial unrelated page "
+        "(example.com) and one real Finviz page, all in the same session, to tell generic "
+        "runner/Chrome slowness apart from Finviz-specific slowness. Writes nothing to "
+        "Sheets. Pass a ticker with --tickers to override the default (AAPL). Deliberately "
+        "NOT env-configurable — see note above main(). See test_baseline_speed().",
     )
     parser.add_argument(
         "--web-app-url",
@@ -1827,7 +2003,10 @@ if __name__ == "__main__":
     elif args.test_batch:
         test_small_batch(args.tickers or None, delay=args.delay, **output_kwargs)
     elif args.test_baseline:
-        test_baseline_speed(headless=not args.show)
+        test_baseline_speed(
+            headless=not args.show,
+            finviz_ticker=args.tickers[0] if args.tickers else "AAPL",
+        )
     else:
         resume_offset = 0
         total_universe: Optional[int] = None
@@ -1854,13 +2033,41 @@ if __name__ == "__main__":
             run_date = datetime.now(timezone.utc).date().isoformat()
 
             if args.resume:
+                # NOTE — DO NOT pass spreadsheet_id here. This was a real,
+                # silent, sweep-breaking bug: it used to pass
+                # args.tickers_spreadsheet_id, i.e. the 'US Stocks using
+                # Claude' file the TICKER LIST is read from. But
+                # ScraperProgress lives in the OTHER spreadsheet — the one
+                # the Web App is deployed inside (Earnings_Test), which is
+                # what doGet falls back to when no spreadsheet_id is given.
+                # So every run wrote its checkpoint to Earnings_Test and
+                # then read progress from a file that has no
+                # ScraperProgress tab at all. doGet answers that with
+                # {ok: true, found: false} — a perfectly successful
+                # response meaning "no progress recorded yet" — so nothing
+                # raised, nothing warned, and resolve_resume_start()
+                # correctly turned "no progress" into "start at ticker 1".
+                # Net effect: EVERY run restarted from ticker 1 forever,
+                # no matter how far the previous one got. Confirmed in
+                # production: run #43 logged "Progress saved: 360/5336"
+                # and run #44 then announced a fresh sweep from the top.
                 try:
-                    progress = fetch_progress_via_webapp(
-                        args.web_app_url, spreadsheet_id=args.tickers_spreadsheet_id
-                    )
+                    progress = fetch_progress_via_webapp(args.web_app_url)
                 except Exception as e:
                     print(f"Could not fetch progress cursor ({e}) — starting from the top as a fallback.")
                     progress = None
+
+                # Print what actually came back. A silent "found: false" is
+                # indistinguishable from a genuine first run unless it is
+                # stated out loud, which is exactly how the bug above
+                # survived as long as it did.
+                if progress is None:
+                    print("Progress cursor: none recorded yet (this is normal only on a genuinely fresh sweep).")
+                else:
+                    print(f"Progress cursor read: next_index={progress.get('next_index')}, "
+                          f"last_ticker={progress.get('last_ticker')}, "
+                          f"last_updated={progress.get('last_updated')}.")
+
                 resume_offset = resolve_resume_start(progress, total_universe)
             else:
                 print("--no-resume: ignoring any saved progress, starting a fresh sweep from the top.")
