@@ -1040,6 +1040,42 @@ def write_via_webapp(
     raise last_error
 
 
+def _get_with_retry(web_app_url: str, params: Dict, what: str,
+                    retries: int = 4, retry_delay: float = 5.0):
+    """A GET against the Web App with the same escalating backoff the
+    write path already has (5s, 15s, 30s, 60s).
+
+    WHY: the two reads that happen at STARTUP — the ticker list and the
+    progress cursor — used to be single, unprotected requests. Any
+    transient Apps Script hiccup killed the process before a single
+    ticker was scraped. In the run history that shows up as "Process
+    completed with exit code 1" plus "No files were found with the
+    provided path: scraped_data/" — a whole ~6-hour scheduled slot
+    burned for nothing (runs 49, 67, 70, 84, 92, 99, 107 at minimum).
+    Writes already survived this because write_via_webapp retries;
+    these two reads did not.
+    """
+    import requests
+
+    last_error = None
+    for attempt in range(retries + 1):
+        try:
+            resp = requests.get(web_app_url, params=params, timeout=30)
+            resp.raise_for_status()
+            result = resp.json()
+            if not result.get("ok"):
+                raise RuntimeError(f"Web App reported an error {what}: {result.get('error')}")
+            return result
+        except Exception as e:
+            last_error = e
+            if attempt < retries:
+                delay = retry_delay * (1, 3, 6, 12)[min(attempt, 3)]
+                print(f"  {what} failed (attempt {attempt + 1}/{retries + 1}): {e} "
+                      f"— retrying in {delay:.0f}s...")
+                time.sleep(delay)
+    raise last_error
+
+
 def fetch_tickers_from_sheet(
     web_app_url: str,
     sheet_name: str = "Tickers",
@@ -1067,11 +1103,7 @@ def fetch_tickers_from_sheet(
     if spreadsheet_id:
         params["spreadsheet_id"] = spreadsheet_id
 
-    resp = requests.get(web_app_url, params=params, timeout=30)
-    resp.raise_for_status()
-    result = resp.json()
-    if not result.get("ok"):
-        raise RuntimeError(f"Web App reported an error fetching tickers: {result.get('error')}")
+    result = _get_with_retry(web_app_url, params, "fetching the ticker list")
     tickers = result.get("tickers", [])
     print(f"Fetched {len(tickers)} tickers from sheet {sheet_name!r}, column {column!r}.")
     return tickers
@@ -1124,11 +1156,7 @@ def fetch_progress_via_webapp(
     if spreadsheet_id:
         params["spreadsheet_id"] = spreadsheet_id
 
-    resp = requests.get(web_app_url, params=params, timeout=30)
-    resp.raise_for_status()
-    result = resp.json()
-    if not result.get("ok"):
-        raise RuntimeError(f"Web App reported an error fetching progress: {result.get('error')}")
+    result = _get_with_retry(web_app_url, params, "fetching the progress cursor")
     if not result.get("found"):
         return None
     return result.get("progress")
@@ -2054,8 +2082,18 @@ if __name__ == "__main__":
                 try:
                     progress = fetch_progress_via_webapp(args.web_app_url)
                 except Exception as e:
-                    print(f"Could not fetch progress cursor ({e}) — starting from the top as a fallback.")
-                    progress = None
+                    # DO NOT fall back to "start from the top" here. That used
+                    # to be the behaviour, and one flaky GET would silently
+                    # discard an in-flight sweep and restart all 5,336 tickers.
+                    # Aborting costs ONE scheduled slot; the next run picks up
+                    # the saved cursor exactly where it was. (Failing to READ
+                    # the cursor is different from being told none exists —
+                    # a genuine first run still returns found:false and
+                    # correctly starts at ticker 1.)
+                    print(f"\nABORTING: could not read the progress cursor after all retries ({e}).")
+                    print("Refusing to restart the sweep from ticker 1 — the saved cursor is intact "
+                          "and the next scheduled run will resume from it. No data has been touched.")
+                    sys.exit(1)
 
                 # Print what actually came back. A silent "found: false" is
                 # indistinguishable from a genuine first run unless it is
