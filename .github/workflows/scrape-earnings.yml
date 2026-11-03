@@ -15,7 +15,7 @@ on:
     # runs late when everyone schedules on the hour. Runs may still start
     # a few minutes late; the concurrency group below means a late or slow
     # run only ever makes the next one wait, never overlap.
-    - cron: '13 * * * *'
+    - cron: '7 * * * *'
   workflow_dispatch:
     inputs:
       tickers_limit:
