@@ -195,6 +195,23 @@ PRICE_HEADERS = (
     + ["last_updated"]
 )
 
+# A Post-Earnings-Moves row is only COMPLETE once "price_p1wk" (the price
+# one week after the report) exists — it is the last value in time, so if
+# it is filled, everything before it is too. Until then the row keeps
+# being refreshed on every sweep, exactly like the EPS/revenue tables
+# keep refreshing until "reported" arrives; after that it is frozen.
+#
+# WHY: price rows used to be written ONCE and never touched again
+# (finalize_column=None). That froze any row saved too early: Finviz shows
+# a placeholder row for an upcoming report days in advance, and a row
+# scraped on report day has none of the after-report prices yet. On
+# 2026-11-02, 2,520 of the 2,626 reports from Sep-Nov 2026 were missing
+# their one-week price for exactly this reason.
+#
+# Known, accepted side effect: ~600 old rows where Finviz itself has no
+# one-week price will be harmlessly rewritten every sweep.
+PRICE_FINALIZE_COLUMN = "price_p1wk"
+
 DATE_SESSION_PATTERN = re.compile(r"^(.*\d{4})\s+(BMO|AMC)$")
 
 
@@ -722,9 +739,9 @@ def upsert_csv(
 
     Three cases per row:
     - Key not seen before -> appended.
-    - Key seen before, finalize_column=None -> left alone. Used for
-      Price Reaction: once a quarter's price data exists, it's a fixed
-      historical fact and never needs re-writing.
+    - Key seen before, finalize_column=None -> left alone. (Price
+      Reaction used to use this; it now uses PRICE_FINALIZE_COLUMN —
+      see the comment on that constant for why.)
     - Key seen before, finalize_column set (e.g. "reported") -> if the
       EXISTING row's value in that column is still empty, the ENTIRE row
       is refreshed with the new data (covers both "a forecast estimate
@@ -809,7 +826,7 @@ def save_to_csvs(
     a1, u1 = upsert_csv(eps_path, EPS_HEADERS, eps_rows, finalize_column="reported")
     a2, u2 = upsert_csv(gaap_eps_path, GAAP_EPS_HEADERS, gaap_eps_rows, finalize_column="reported")
     a3, u3 = upsert_csv(revenue_path, REVENUE_HEADERS, revenue_rows, finalize_column="reported")
-    a4, u4 = upsert_csv(price_path, PRICE_HEADERS, price_rows, finalize_column=None)
+    a4, u4 = upsert_csv(price_path, PRICE_HEADERS, price_rows, finalize_column=PRICE_FINALIZE_COLUMN)
 
     print(f"  {eps_path}: +{a1} new, {u1} updated")
     print(f"  {gaap_eps_path}: +{a2} new, {u2} updated")
@@ -856,9 +873,9 @@ def upsert_rows(
     quarter) rows.
 
     - A key not already present -> appended.
-    - A key already present, finalize_column=None -> left alone (used for
-      Price Reaction: once a quarter's price data exists, it's a fixed
-      historical fact and never needs re-writing).
+    - A key already present, finalize_column=None -> left alone. (Price
+      Reaction used to use this; it now uses PRICE_FINALIZE_COLUMN —
+      see the comment on that constant for why.)
     - A key already present, finalize_column set (e.g. "reported") -> if
       the EXISTING row's value in that column is still empty, the ENTIRE
       row is refreshed with the new data. This covers both "a forecast
@@ -1765,7 +1782,7 @@ def run_batch(
                 _write_table("Raw_EPSHistory", EPS_HEADERS, batch_eps, "eps_appended", "eps_updated", "reported")
                 _write_table("Raw_GAAPEPSHistory", GAAP_EPS_HEADERS, batch_gaap_eps, "gaap_eps_appended", "gaap_eps_updated", "reported")
                 _write_table("Raw_RevenueHistory", REVENUE_HEADERS, batch_revenue, "revenue_appended", "revenue_updated", "reported")
-                _write_table("Raw_PostEarningsMoves", PRICE_HEADERS, batch_price, "price_appended", "price_updated", None)
+                _write_table("Raw_PostEarningsMoves", PRICE_HEADERS, batch_price, "price_appended", "price_updated", PRICE_FINALIZE_COLUMN)
             else:
                 appended, updated = upsert_rows(eps_ws, batch_eps, finalize_column="reported")
                 totals["eps_appended"] += appended; totals["eps_updated"] += updated
@@ -1779,7 +1796,7 @@ def run_batch(
                 totals["revenue_appended"] += appended; totals["revenue_updated"] += updated
                 print(f"  Raw_RevenueHistory: +{appended} new, {updated} updated")
 
-                appended, updated = upsert_rows(price_ws, batch_price, finalize_column=None)
+                appended, updated = upsert_rows(price_ws, batch_price, finalize_column=PRICE_FINALIZE_COLUMN)
                 totals["price_appended"] += appended; totals["price_updated"] += updated
                 print(f"  Raw_PostEarningsMoves: +{appended} new, {updated} updated")
 

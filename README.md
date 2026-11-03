@@ -28,7 +28,7 @@ Finviz builds these earnings widgets in the browser with JavaScript after the pa
 
 ## How the data is loaded
 
-- **Upsert on ticker and quarter.** A new ticker and quarter pair is added as a new row. An existing row is never duplicated. A forecast row (estimate only) is updated in place until the reported figure arrives, then it is frozen. Price reaction rows are written once and never changed.
+- **Upsert on ticker and quarter.** A new ticker and quarter pair is added as a new row. An existing row is never duplicated. A forecast row (estimate only) is updated in place until the reported figure arrives, then it is frozen. A price reaction row is treated the same way: it keeps being refreshed until the one-week-after price (`price_p1wk`) exists, then it is frozen.
 - **Correct ordering across years and reporting styles.** Sorting labels like `Q4 '24` and `Q1 '25` as text puts them in the wrong order, so every row gets a `quarter_sort` number: year × 10 + a slot. Q1 to Q4 use slots 1 to 4. Semi-annual reporters (`S1`/`S2`, or `H1`/`H2`) use 5 and 6, and annual reporters (`FY`) use 9. These slots never collide. Any label the scraper does not recognise is kept and printed as a loud warning, never silently dropped.
 - **No data is not the same as failed.** ETFs and some unlisted tickers have no earnings widgets at all. These are recorded as `NO_DATA`, which is expected, and kept separate from `FAILED`, which is worth investigating.
 - **A safe receiver.** Rows are sent to a Google Apps Script web app (`finviz_data_receiver.gs`). It writes under `LockService`, so two requests arriving at once cannot both add the same row. It also matches columns by name, so adding a new field never shifts data into the wrong column.
