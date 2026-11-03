@@ -1145,7 +1145,32 @@ def fetch_tickers_from_sheet(
 # since nothing it does is actually saved.
 # ---------------------------------------------------------------------------
 
-PROGRESS_HEADERS = ["row_id", "run_date", "next_index", "total_tickers", "last_ticker", "last_updated"]
+PROGRESS_HEADERS = [
+    "row_id", "run_date", "started_at", "start_index", "next_index",
+    "total_tickers", "last_ticker", "last_updated", "status",
+]
+# ONE ROW PER WORKFLOW RUN (since 2026-11). Each run writes its own row,
+# keyed by row_id = "run-<GitHub run number>", and keeps updating it as it
+# goes. The next run resumes from whichever row has the newest
+# last_updated (see doGet mode=progress in finviz_data_receiver.gs). This
+# replaced a single row that every run overwrote: same guarantee that the
+# latest bookmark is always found, plus a readable history of how far each
+# run got and how it ended (the "status" column).
+#
+# status values:
+#   running         - written at start and every checkpoint. If a row is
+#                     left at "running", that run was killed or crashed
+#                     before it could write anything else.
+#   stopped on time - hit its time budget and stopped cleanly; the next
+#                     run carries on from next_index.
+#   sweep finished  - reached the last ticker of the universe; the next
+#                     run starts a fresh sweep from ticker 1.
+#   limit reached   - a manual run limited with --tickers-limit finished
+#                     its slice.
+#   crashed         - an unexpected error stopped the run; next_index is
+#                     the last checkpoint that was actually saved.
+#
+# The comment below explains why row_id exists at all.
 # row_id is ALWAYS the literal string "current" — see write_progress_via_webapp
 # for why this exists: run_date was originally used as the key, but Google
 # Sheets auto-detects date-looking strings and silently stores them as a
@@ -1179,6 +1204,27 @@ def fetch_progress_via_webapp(
     return result.get("progress")
 
 
+def current_run_id() -> str:
+    """The row_id for this run's ScraperProgress row.
+
+    On GitHub Actions this is "run-<run number>", e.g. "run-231" — the same
+    number shown in the Actions tab, so a row can be matched to its log.
+    A re-run of the same workflow run gets "-a2", "-a3"... so it doesn't
+    overwrite the original attempt's row. Locally (no GITHUB_RUN_NUMBER)
+    it is "local-<UTC timestamp>".
+
+    The "run-" prefix is deliberate: a bare number like "231" or a value
+    like "231-2" can be silently converted by Google Sheets into a number
+    or a date, which is exactly the kind of type change that broke key
+    matching on this sheet once before (see PROGRESS_HEADERS).
+    """
+    number = os.environ.get("GITHUB_RUN_NUMBER")
+    if not number:
+        return "local-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "1")
+    return f"run-{number}" + (f"-a{attempt}" if attempt not in ("", "1") else "")
+
+
 def write_progress_via_webapp(
     web_app_url: str,
     next_index: int,
@@ -1186,29 +1232,34 @@ def write_progress_via_webapp(
     run_date: str,
     last_ticker: str,
     sheet_name: str = "ScraperProgress",
+    run_id: Optional[str] = None,
+    started_at: str = "",
+    start_index: Optional[int] = None,
+    status: str = "running",
 ) -> None:
-    """Overwrites the single ScraperProgress row with the current cursor
-    position. mode="overwrite" (see finviz_data_receiver.gs) is what lets
-    this update the SAME row every checkpoint instead of the normal
-    once-and-frozen upsert behavior every other table uses.
+    """Creates or updates THIS run's row in ScraperProgress (one row per
+    workflow run — see the PROGRESS_HEADERS comment). mode="overwrite"
+    (see finviz_data_receiver.gs) is what lets the same row be updated at
+    every checkpoint instead of the normal once-and-frozen upsert
+    behaviour the data tables use.
 
-    Keyed on the constant row_id="current", NOT run_date — see the
-    PROGRESS_HEADERS comment above for why: run_date being auto-converted
-    to a Date object by Sheets broke key-matching on every write, causing
-    silent duplicate rows instead of one row that actually advances.
+    Keyed on row_id, NOT run_date: run_date was once the key, and Google
+    Sheets silently converting it into a Date object broke key matching,
+    so every write appended a new row instead of updating one.
 
-    last_ticker is the actual symbol most recently processed (i.e. the
-    ticker at position next_index - 1) — purely for a human reading the
-    sheet, so "next_index: 2000" doesn't require cross-referencing
-    Raw_Universe to know what that number means. Not used by the resume
-    logic itself, which only ever reads next_index."""
+    last_ticker is the symbol most recently processed (the ticker at
+    position next_index - 1), purely for a human reading the sheet. The
+    resume logic only ever reads next_index."""
     row = {
-        "row_id": "current",
+        "row_id": run_id or current_run_id(),
         "run_date": run_date,
+        "started_at": started_at,
+        "start_index": "" if start_index is None else start_index,
         "next_index": next_index,
         "total_tickers": total_tickers,
         "last_ticker": last_ticker,
         "last_updated": datetime.now(timezone.utc).isoformat(),
+        "status": status,
     }
     write_via_webapp(
         web_app_url, sheet_name, PROGRESS_HEADERS, [row],
@@ -1285,7 +1336,11 @@ def trigger_sort_via_webapp(web_app_url: str) -> None:
     effect on the correctness of any data already safely written.
     """
     try:
-        write_via_webapp(web_app_url, sheet_name="sort_all", headers=[], rows=[], action="sort_all")
+        # retries=1, not the default 4: sorting is cosmetic, and with hourly
+        # runs a slow sheet plus five long retries could push a run past
+        # its timeout. One retry, then give up until the next run.
+        write_via_webapp(web_app_url, sheet_name="sort_all", headers=[], rows=[],
+                         action="sort_all", retries=1)
     except Exception as e:
         print(f"  WARNING: could not sort sheets at end of run ({e}). "
               f"Data is unaffected — this is purely cosmetic and will be retried on the next run.")
@@ -1652,6 +1707,7 @@ def run_batch(
     run_date: Optional[str] = None,
     progress_sheet_name: str = "ScraperProgress",
     is_fresh_sweep_start: bool = False,
+    time_budget_minutes: Optional[float] = None,
 ) -> Dict:
     """
     Two ways to write to Google Sheets — pick ONE:
@@ -1697,6 +1753,43 @@ def run_batch(
 
     track_progress = bool(use_webapp and run_date and not dry_run)
     total_universe = total_universe if total_universe is not None else (resume_offset + len(tickers))
+
+    # CLEAN STOP: time_budget_minutes is how long this run may spend
+    # SCRAPING. Before starting each ticker the loop checks the clock; once
+    # the budget is used up it saves, writes status "stopped on time" and
+    # returns normally, so the job ends green instead of being killed by
+    # GitHub's timeout-minutes. The budget is checked only BEFORE a ticker
+    # starts, so the run can overshoot by one ticker (up to ~2.5 min in
+    # the worst case seen), plus the final save and sort — the workflow's
+    # timeout-minutes leaves room for that. None means no limit.
+    run_started = time.monotonic()
+    time_budget_seconds = None if time_budget_minutes is None else time_budget_minutes * 60
+    run_id = current_run_id()
+    started_at = datetime.now(timezone.utc).isoformat()
+    # The last checkpoint actually saved — used if the run crashes, so the
+    # "crashed" row never claims tickers whose data wasn't written.
+    saved = {"done": 0, "last_ticker": ""}
+
+    def save_progress(done: int, last_ticker: str, status: str) -> None:
+        """Writes this run's ScraperProgress row. Never raises: a progress
+        hiccup must not take down a run whose data is already written."""
+        absolute_next_index = resume_offset + done
+        try:
+            write_progress_via_webapp(
+                web_app_url, absolute_next_index, total_universe, run_date, last_ticker,
+                sheet_name=progress_sheet_name, run_id=run_id, started_at=started_at,
+                start_index=resume_offset, status=status,
+            )
+            print(f"  Progress saved: {absolute_next_index}/{total_universe} tickers done this sweep "
+                  f"(last: {last_ticker or '-'}, status: {status}, row: {run_id}).")
+        except Exception as e:
+            print(f"  WARNING: could not save progress ({e}). "
+                  f"Data above this line is still safe; the next run resumes from the last saved row.")
+
+    if track_progress:
+        print(f"Progress row for this run: {run_id}"
+              + (f" (time budget {time_budget_minutes:g} min)" if time_budget_minutes else ""))
+        save_progress(0, "", "running")
 
     if track_progress and is_fresh_sweep_start:
         try:
@@ -1802,9 +1895,37 @@ def run_batch(
 
         batch_eps, batch_gaap_eps, batch_revenue, batch_price = [], [], [], []
 
-    def _run_scrape_loop():
+    def checkpoint(done: int, last_ticker: str, desc: str, status: str) -> None:
+        """Flushes buffered rows, saves this run's progress row and records
+        any scrape issues. Called every batch_size tickers, at the end of
+        the run's list, and when the time budget runs out."""
+        nonlocal batch_issues
+        flush(desc)
+        if not track_progress:
+            return
+        save_progress(done, last_ticker, status)
+        saved["done"], saved["last_ticker"] = done, last_ticker
+        if batch_issues:
+            try:
+                write_issues_via_webapp(web_app_url, batch_issues, run_date, clear_first=False)
+                print(f"  {ISSUES_SHEET_NAME}: recorded {len(batch_issues)} issue(s) from this batch.")
+            except Exception as e:
+                print(f"  WARNING: could not save scrape issues ({e}). "
+                      f"They're still visible in this console output above.")
+            batch_issues = []
+
+    def _run_scrape_loop() -> str:
+        """Returns the run's final status (see PROGRESS_HEADERS)."""
         nonlocal ok_count, no_data_count, batch_issues
         for i, ticker in enumerate(tickers):
+            if (time_budget_seconds is not None and i > 0
+                    and time.monotonic() - run_started >= time_budget_seconds):
+                print(f"\nTime budget of {time_budget_minutes:g} min used up after {i} of "
+                      f"{len(tickers)} tickers — stopping cleanly. The next run continues from here.")
+                checkpoint(i, tickers[i - 1], f"time budget reached after {i}/{len(tickers)} tickers",
+                           "stopped on time")
+                return "stopped on time"
+
             print(f"[{i + 1}/{len(tickers)}] Scraping {ticker}...")
             ticker_started = time.monotonic()
             try:
@@ -1831,46 +1952,32 @@ def run_batch(
                 print(f"  FAILED ({elapsed:.1f}s, worth investigating): {e}")
 
             is_last = i == len(tickers) - 1
-            if (i + 1) % batch_size == 0 or is_last:
-                flush(f"after {i + 1}/{len(tickers)} tickers")
+            if is_last:
+                final = ("sweep finished" if resume_offset + i + 1 >= total_universe
+                         else "limit reached")
+                checkpoint(i + 1, ticker, f"after {i + 1}/{len(tickers)} tickers", final)
+                return final
+            if (i + 1) % batch_size == 0:
+                checkpoint(i + 1, ticker, f"after {i + 1}/{len(tickers)} tickers", "running")
 
-                if track_progress:
-                    absolute_next_index = resume_offset + (i + 1)
-                    try:
-                        write_progress_via_webapp(
-                            web_app_url, absolute_next_index, total_universe, run_date, ticker,
-                            sheet_name=progress_sheet_name,
-                        )
-                        print(f"  Progress saved: {absolute_next_index}/{total_universe} tickers done today "
-                              f"(last: {ticker}).")
-                    except Exception as e:
-                        # Never let a progress-tracking hiccup take down an
-                        # otherwise-successful run — the actual data is
-                        # already safely written above; worst case here is
-                        # just that the NEXT run doesn't know to resume and
-                        # re-scrapes from the top, which is wasteful but not
-                        # harmful (the upsert logic is safe to repeat).
-                        print(f"  WARNING: could not save progress cursor ({e}). "
-                              f"Data above this line is still safe; next run may restart from the top.")
+            time.sleep(delay)
+        return "limit reached"
 
-                    if batch_issues:
-                        try:
-                            write_issues_via_webapp(web_app_url, batch_issues, run_date, clear_first=False)
-                            print(f"  {ISSUES_SHEET_NAME}: recorded {len(batch_issues)} issue(s) from this batch.")
-                        except Exception as e:
-                            print(f"  WARNING: could not save scrape issues ({e}). "
-                                  f"They're still visible in this console output above.")
-                        batch_issues = []
-
-            if not is_last:
-                time.sleep(delay)
-
+    final_status = "crashed"
     try:
-        _run_scrape_loop()
+        final_status = _run_scrape_loop()
     finally:
+        if final_status == "crashed" and track_progress:
+            # Best effort: mark this run's row so the sheet shows what
+            # happened. next_index stays at the last checkpoint actually
+            # saved, never past it.
+            print("\nRun stopped by an unexpected error — marking its progress row as crashed.")
+            save_progress(saved["done"], saved["last_ticker"], "crashed")
         if use_webapp and not dry_run:
             print("\nSorting sheets once at the end of this run...")
             trigger_sort_via_webapp(web_app_url)
+
+    print(f"\nRun ended with status: {final_status}")
 
     print(
         f"\n{ok_count} OK, {no_data_count} NO_DATA, {len(failed_tickers)} FAILED"
@@ -1900,6 +2007,7 @@ def run_batch(
         "no_data_count": no_data_count,
         "failed_tickers": failed_tickers,
         "totals": totals,
+        "status": final_status,
     }
 
 
@@ -2039,6 +2147,14 @@ if __name__ == "__main__":
         help="Only use the first N tickers from the fetched/given list — e.g. --tickers-limit 20 "
         "to test against a small slice of a large sheet. Env var: FINVIZ_TICKERS_LIMIT",
     )
+    parser.add_argument(
+        "--time-budget-minutes",
+        type=float,
+        default=_env_float("FINVIZ_TIME_BUDGET_MINUTES"),
+        help="Stop starting new tickers after this many minutes of scraping, save, and exit "
+        "cleanly (status 'stopped on time'); the next run resumes from there. Unset = no limit. "
+        "Env var: FINVIZ_TIME_BUDGET_MINUTES",
+    )
     args = parser.parse_args()
 
     output_kwargs = {"output_dir": args.output_dir} if args.output_dir else {}
@@ -2160,5 +2276,6 @@ if __name__ == "__main__":
             total_universe=total_universe,
             run_date=run_date,
             is_fresh_sweep_start=(args.tickers_from_sheet and resume_offset == 0),
+            time_budget_minutes=args.time_budget_minutes,
             **output_kwargs,
         )

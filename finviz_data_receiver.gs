@@ -184,7 +184,13 @@ function doGet(e) {
       var bestTimestamp = null;
       for (var r = 0; r < pAllRows.length; r++) {
         var row = pAllRows[r];
-        if (rowIdIdx !== -1 && row[rowIdIdx] !== 'current') continue;
+        // Since 2026-11 every workflow run writes its OWN row (row_id like
+        // "run-231"), so any row with a non-blank row_id is a candidate and
+        // the one with the newest last_updated wins. Rows with a blank
+        // row_id are legacy rows from before row_id existed: never read.
+        // (The old single row_id="current" row is still a valid candidate;
+        // it simply stops being the newest once per-run rows appear.)
+        if (rowIdIdx !== -1 && (row[rowIdIdx] === '' || row[rowIdIdx] === null)) continue;
         var ts = lastUpdatedIdx !== -1 ? row[lastUpdatedIdx] : null;
         if (bestRow === null || (ts && (!bestTimestamp || new Date(ts) > new Date(bestTimestamp)))) {
           bestRow = row;

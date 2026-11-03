@@ -1,15 +1,21 @@
 name: Scrape Finviz Earnings
 
-# Runs automatically every 6 hours (4x/day), chaining through the day via
-# the resumable progress cursor built into finviz_earnings_scraper.py —
-# each run picks up wherever the last one left off (see ScraperProgress
-# in the sheet), so together they cover the full ~5,336-ticker universe
-# without ever needing more than one run writing at a time. Also
+# Runs automatically every hour, chaining through the day via the
+# resumable progress cursor built into finviz_earnings_scraper.py — each
+# run picks up wherever the last one left off (one row per run in
+# ScraperProgress), so together they cover the full ~5,336-ticker universe
+# without ever needing more than one run writing at a time. Each run
+# scrapes for a fixed time budget and then stops cleanly (see
+# FINVIZ_TIME_BUDGET_MINUTES below). Also
 # runnable by hand any time from the Actions tab, optionally limited to
 # a small number of tickers for a quick test.
 on:
   schedule:
-    - cron: '0 0,6,12,18 * * *'  # 00:00, 06:00, 12:00, 18:00 UTC
+    # Every hour at 7 minutes past. Not minute 0: GitHub starts scheduled
+    # runs late when everyone schedules on the hour. Runs may still start
+    # a few minutes late; the concurrency group below means a late or slow
+    # run only ever makes the next one wait, never overlap.
+    - cron: '7 * * * *'
   workflow_dispatch:
     inputs:
       tickers_limit:
@@ -44,11 +50,13 @@ concurrency:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    # Stops cleanly a bit before GitHub's hard 360-minute cap per job.
-    # Even if a run gets cut off here, nothing is lost beyond the last
-    # unfinished 20-ticker batch — see the checkpointing/resume logic in
-    # the script itself.
-    timeout-minutes: 340
+    # Safety net only — a normal run ends on its own well before this
+    # (setup ~1-2 min + 45 min scraping + up to ~2.5 min for the last
+    # ticker + saving and sorting ~1-3 min = roughly 50-53 min). If a run
+    # ever does get cut off here, nothing is lost beyond the last
+    # unfinished 20-ticker batch, and its ScraperProgress row is left at
+    # status "running", which is how you can tell.
+    timeout-minutes: 58
 
     steps:
       - name: Check out repo
@@ -76,6 +84,11 @@ jobs:
           FINVIZ_TICKERS_FROM_SHEET: "true"
           FINVIZ_TICKERS_SHEET_NAME: "Raw_Universe"
           FINVIZ_TICKERS_COLUMN: "Ticker"
+
+          # Clean stop: scrape for this many minutes, then save, sort and
+          # exit normally (status "stopped on time"). Must leave room under
+          # timeout-minutes above for setup, the last ticker and the sort.
+          FINVIZ_TIME_BUDGET_MINUTES: "45"
 
           # Only set when this workflow was triggered manually with a
           # value typed into the "tickers_limit" box above — empty for

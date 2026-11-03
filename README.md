@@ -19,7 +19,7 @@ Two more tables keep track of the runs themselves:
 
 | Table | What it holds |
 |---|---|
-| `ScraperProgress` | One row holding the resume cursor: how far the current sweep has got and the last ticker processed |
+| `ScraperProgress` | One row per workflow run: where it started, how far it got, the last ticker processed and how it ended (`running`, `stopped on time`, `sweep finished`, `limit reached` or `crashed`). Each run resumes from the newest row |
 | `Raw_ScrapeIssues` | Every ticker in the current sweep that failed or had no earnings data, with the reason |
 
 ## Why Selenium
@@ -35,10 +35,10 @@ Finviz builds these earnings widgets in the browser with JavaScript after the pa
 
 ## Schedule and reliability
 
-The workflow in `.github/workflows/scrape-earnings.yml` runs four times a day, at 00:00, 06:00, 12:00 and 18:00 UTC, and can also be started by hand from the Actions tab. A manual run can be limited to the first N tickers for a quick test.
+The workflow in `.github/workflows/scrape-earnings.yml` runs every hour, at 7 minutes past, and can also be started by hand from the Actions tab. A manual run can be limited to the first N tickers for a quick test.
 
 - **Resumable checkpoint.** Results are saved every 20 tickers, together with the resume cursor. Each run continues from the cursor, so chained runs cover the whole universe and an interrupted run loses at most one batch. A new sweep starts only once the previous one has actually finished, however many days that takes.
-- **Timeout.** Each run stops at 340 minutes, inside GitHub's 6-hour limit per job, and the next run resumes from the last checkpoint.
+- **Clean stop.** Each run scrapes for a 45-minute budget, then saves its progress, sorts the sheets and exits normally, so a healthy run always ends green. A 58-minute `timeout-minutes` is only a safety net; a run cut off by it leaves its progress row at `running`.
 - **Concurrency group, and the incident it fixed.** A manual run and a scheduled run once overlapped. Both read the same cursor, scraped the same tickers, doubled the load on Finviz and ran until both hit the 5-hour 40-minute timeout. The workflow now uses one fixed concurrency group shared by both trigger types, with `cancel-in-progress: false`. A new run waits in a queue behind the running one instead of starting alongside it.
 - **Retries.** Writes to the web app wait up to 120 seconds by default and retry up to four times, with longer waits each time. A table write that still fails is counted and reported at the end of the run, and its rows stay in the run's CSV artifact.
 - **Secrets.** The web app URL and the ticker spreadsheet ID are stored in GitHub Secrets, never in the code.
