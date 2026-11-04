@@ -1,0 +1,9 @@
+# Tools for CHECKING the code, used by CI (.github/workflows/ci.yml) and
+# when you run the checks on your own laptop. The scraper itself does not
+# need these — its own packages are in requirements.txt.
+#
+# Exact versions are pinned on purpose: a newer ruff can add rules or
+# change behaviour, which would turn CI red one morning without any change
+# to our code. Upgrading is a deliberate, one-line change here.
+pytest==9.1.1
+ruff==0.16.9
