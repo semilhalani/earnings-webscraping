@@ -1114,8 +1114,6 @@ def fetch_tickers_from_sheet(
     separate sandbox spreadsheet you're testing in. Leave it unset to
     read from the same spreadsheet the Web App lives in.
     """
-    import requests
-
     params = {"sheet": sheet_name, "column": column}
     if spreadsheet_id:
         params["spreadsheet_id"] = spreadsheet_id
@@ -1192,8 +1190,6 @@ def fetch_progress_via_webapp(
     """Returns the current progress row as a dict, or None if no progress
     has ever been recorded (first run ever, or the sheet is empty) —
     callers should treat None the same as "start from index 0"."""
-    import requests
-
     params = {"mode": "progress", "sheet": sheet_name}
     if spreadsheet_id:
         params["spreadsheet_id"] = spreadsheet_id

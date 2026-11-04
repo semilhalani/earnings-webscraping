@@ -1,0 +1,29 @@
+# Settings for the code-checking tools. Nothing here changes how the
+# scraper runs; only ruff reads this file (pytest settings join it in
+# Stage 2).
+
+[tool.ruff]
+# The Python version the scraper and CI run on.
+target-version = "py311"
+
+[tool.ruff.lint]
+# A deliberately small starting rule set: "Pyflakes plus basic
+# pycodestyle".
+#   F          = Pyflakes: real mistakes, e.g. an unused import or a name
+#                used before it is defined.
+#   E4, E7, E9 = basic pycodestyle errors: import problems, statement
+#                problems, and code that cannot even be parsed.
+#
+# Listing the rules here explicitly matters. Newer ruff versions switch on
+# a much larger set by default: ruff 0.16.9's own default reports about
+# 147 findings on this code, mostly modern-style suggestions rather than
+# bugs. Naming the rules keeps CI's behaviour fixed; we can widen it later,
+# one rule group at a time.
+select = ["E4", "E7", "E9", "F"]
+
+# E702 = two statements on one line, joined by ";". The scraper uses this
+# on purpose to keep each pair of counters together, for example:
+#   totals["eps_appended"] += appended; totals["eps_updated"] += updated
+# It is a style choice, not a bug, so the rule is switched off rather than
+# rewriting five lines of working code for style alone.
+ignore = ["E702"]

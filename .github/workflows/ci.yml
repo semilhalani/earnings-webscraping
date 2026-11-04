@@ -1,0 +1,48 @@
+# CI = continuous integration: automatic checks on every change.
+#
+# This workflow is separate from scrape-earnings.yml. It never runs the
+# scraper and never touches Finviz, Chrome or the Google Sheet. It only
+# reads the code and checks it, in about a minute.
+name: CI
+
+# WHEN it runs: on every push to any branch, and whenever a pull request is
+# opened or updated. (A push to a branch that has an open pull request
+# triggers both, so you may see two CI runs for one push. That is normal.)
+on:
+  push:
+  pull_request:
+
+# The token this workflow gets may only READ the repository. CI checks
+# code; it never needs to change anything.
+permissions:
+  contents: read
+
+jobs:
+  # One job named "checks". The name matters later: branch protection will
+  # require "checks" to pass before anything can be merged into main.
+  # Stage 2 adds tests as more steps in this SAME job, so the name stays.
+  checks:
+    # A fresh, temporary Ubuntu Linux machine from GitHub, wiped afterwards.
+    runs-on: ubuntu-latest
+    # Linting takes seconds; anything near 10 minutes means something hung.
+    timeout-minutes: 10
+
+    steps:
+      # 1. Copy this commit's code onto the machine (it starts empty).
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      # 2. Install Python 3.11, the same version the scraper runs on.
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # 3. Install the checking tools listed in requirements-dev.txt.
+      - name: Install the check tools
+        run: pip install -r requirements-dev.txt
+
+      # 4. Lint: read every .py file and report mistakes. If ruff finds any,
+      #    it exits with an error, this step fails, and the run shows a red X.
+      - name: Lint with ruff
+        run: ruff check .
