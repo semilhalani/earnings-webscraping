@@ -1,20 +1,44 @@
 name: Scrape Finviz Earnings
 
-# Runs automatically every hour, chaining through the day via the
-# resumable progress cursor built into finviz_earnings_scraper.py — each
-# run picks up wherever the last one left off (one row per run in
-# ScraperProgress), so together they cover the full ~5,336-ticker universe
-# without ever needing more than one run writing at a time. Each run
-# scrapes for a fixed time budget and then stops cleanly (see
-# FINVIZ_TIME_BUDGET_MINUTES below). Also
-# runnable by hand any time from the Actions tab, optionally limited to
-# a small number of tickers for a quick test.
+# Runs CONTINUOUSLY as a chain: each run scrapes for a fixed time budget,
+# stops cleanly (see FINVIZ_TIME_BUDGET_MINUTES below), and as its last
+# step starts the next run itself (see "Start the next run" at the bottom).
+# Every run picks up wherever the last one left off (one row per run in
+# ScraperProgress), so together they cover the full ~5,336-ticker universe,
+# sweep after sweep, without ever needing more than one run writing at a
+# time.
+#
+# WHY A CHAIN, NOT JUST THE SCHEDULE: GitHub's scheduler is best-effort.
+# Measured on this repo (5 Oct - 4 Nov 2026): scheduled runs started a
+# median ~4 hours late, about 1 in 8 six-hourly slots never ran at all, and
+# after switching to hourly only 2 of ~21 slots ran. GitHub's docs say
+# scheduled runs can be delayed or dropped under load. Runs started by
+# workflow_dispatch, by contrast, start immediately — so each run starts
+# the next one that way.
+#
+# If a run FAILS, the next run is still started — unless the two runs
+# before it failed too. Three failures in a row means something is really
+# broken (Finviz blocking, the Apps Script down), so the chain stops rather
+# than loop; the backup schedule tries again later, once per delivered
+# slot. Cancelling a run yourself stops the chain. To stop everything:
+# Actions tab > this workflow > "..." > Disable workflow.
+#
+# The queue can never pile up: the concurrency group below allows only one
+# run going and one waiting. A newer waiting run replaces an older one.
+#
+# Also runnable by hand any time from the Actions tab, optionally limited
+# to a small number of tickers for a quick test (a limited test run does
+# NOT start the chain).
 on:
   schedule:
-    # Every hour at 7 minutes past. Not minute 0: GitHub starts scheduled
-    # runs late when everyone schedules on the hour. Runs may still start
-    # a few minutes late; the concurrency group below means a late or slow
-    # run only ever makes the next one wait, never overlap.
+    # BACKUP ONLY. The chain (see top of file) normally keeps runs going on
+    # its own; this schedule exists to restart the chain if it ever stops —
+    # e.g. after a run that crashed, which deliberately does not start a
+    # next run. Not minute 0: GitHub delays scheduled runs most on the
+    # hour. If a scheduled run arrives while a chained run is already
+    # waiting, GitHub cancels one of the two waiting runs ("Canceling since
+    # a higher priority waiting request ... exists") — harmless: one of
+    # them still runs, and it continues the chain.
     - cron: '13 * * * *'
   workflow_dispatch:
     inputs:
@@ -50,13 +74,23 @@ concurrency:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    # Safety net only — a normal run ends on its own well before this
-    # (setup ~1-2 min + 45 min scraping + up to ~2.5 min for the last
-    # ticker + saving and sorting ~1-3 min = roughly 50-53 min). If a run
-    # ever does get cut off here, nothing is lost beyond the last
-    # unfinished 20-ticker batch, and its ScraperProgress row is left at
+    # The built-in token may only read the repo by default. actions: write
+    # lets the last step start the next run of this workflow; nothing else
+    # is granted.
+    permissions:
+      contents: read
+      actions: write
+    # Last-resort safety net. A normal run ends on its own at roughly
+    # 50 min (setup ~1-2 min + 45 min scraping + up to ~2.5 min for the
+    # last ticker + saving and sorting ~1-3 min). The scraper step has its
+    # own, shorter limit (54 min, see "Run scraper") so that if scraping
+    # ever overruns, only that step is stopped and the chain step at the
+    # bottom still gets to run. If THIS job limit is ever hit instead,
+    # GitHub kills the whole job and the backup schedule restarts the
+    # chain. Either way nothing is lost beyond the last unfinished
+    # 20-ticker batch, and that run's ScraperProgress row is left at
     # status "running", which is how you can tell.
-    timeout-minutes: 58
+    timeout-minutes: 60
 
     steps:
       - name: Check out repo
@@ -74,6 +108,9 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Run scraper
+        id: scrape
+        # See the job's timeout-minutes above for why this step has its own.
+        timeout-minutes: 54
         env:
           # --- Secrets: real values live in GitHub Settings > Secrets,
           # never in this file or anywhere in the repo's code/history. ---
@@ -104,3 +141,51 @@ jobs:
           name: scraped-data-run-${{ github.run_number }}
           path: scraped_data/
           retention-days: 14
+
+      # THE CHAIN. Starts the next run of this same workflow. It waits in
+      # the concurrency queue until this run has fully finished, then
+      # carries on from this run's progress row.
+      #
+      # When it runs (the "if:" line):
+      #   - not if this run was cancelled (by you, or by GitHub replacing a
+      #     waiting run) — cancelling means "stop".
+      #   - not after a manual test limited to N tickers. For scheduled and
+      #     chained runs the input doesn't exist, which counts as empty.
+      #   - otherwise yes, even if the scraper step failed, because of the
+      #     brake below.
+      #
+      # THE BRAKE: if the scraper step failed, look at the last two runs of
+      # this workflow that actually ran (cancelled ones skipped). If both of
+      # those failed too, this is the third failure in a row: stop the
+      # chain instead of looping. Otherwise try again with a fresh run.
+      #
+      # GitHub documents that a workflow's own GITHUB_TOKEN is allowed to
+      # start new runs via workflow_dispatch (unlike most other events).
+      - name: Start the next run (keeps the sweep going continuously)
+        if: ${{ !cancelled() && !inputs.tickers_limit }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SCRAPE_OUTCOME: ${{ steps.scrape.outcome }}
+        run: |
+          if [ "$SCRAPE_OUTCOME" != "success" ]; then
+            earlier_failures=$(gh run list --workflow scrape-earnings.yml --status completed --limit 10 \
+              --json conclusion \
+              --jq '[.[] | select(.conclusion != "cancelled")][:2] | map(select(.conclusion == "failure")) | length' \
+              || echo 0)
+            if [ "${earlier_failures:-0}" -ge 2 ]; then
+              echo "::warning::Third failed run in a row: NOT starting another run. Check the logs; the backup schedule will try again later."
+              exit 0
+            fi
+            echo "Scraper step failed (outcome: $SCRAPE_OUTCOME), but the previous runs did not both fail — starting a fresh run."
+          fi
+          for attempt in 1 2 3; do
+            if gh workflow run scrape-earnings.yml --ref "$GITHUB_REF_NAME"; then
+              echo "Next run requested."
+              exit 0
+            fi
+            echo "Could not start the next run (attempt $attempt of 3); retrying in 20s..."
+            sleep 20
+          done
+          echo "::error::Could not start the next run after 3 attempts. The backup schedule will restart the chain."
+          exit 1
