@@ -1,8 +1,8 @@
 # CI = continuous integration: automatic checks on every change.
 #
 # This workflow is separate from scrape-earnings.yml. It never runs the
-# scraper and never touches Finviz, Chrome or the Google Sheet. It only
-# reads the code and checks it, in about a minute.
+# scraper and never touches Finviz, Chrome or the Google Sheet. It reads
+# the code (lint) and runs the tests on saved data, in about a minute.
 name: CI
 
 # WHEN it runs: on every push to any branch, and whenever a pull request is
@@ -18,13 +18,13 @@ permissions:
   contents: read
 
 jobs:
-  # One job named "checks". The name matters later: branch protection will
-  # require "checks" to pass before anything can be merged into main.
-  # Stage 2 adds tests as more steps in this SAME job, so the name stays.
+  # One job named "checks". The name matters: branch protection requires
+  # "checks" to pass before anything can be merged into main. Tests are
+  # more steps in this SAME job, so the name (and the protection) stays.
   checks:
     # A fresh, temporary Ubuntu Linux machine from GitHub, wiped afterwards.
     runs-on: ubuntu-latest
-    # Linting takes seconds; anything near 10 minutes means something hung.
+    # Lint and tests take seconds; anything near 10 minutes means something hung.
     timeout-minutes: 10
 
     steps:
@@ -38,11 +38,21 @@ jobs:
         with:
           python-version: "3.11"
 
-      # 3. Install the checking tools listed in requirements-dev.txt.
-      - name: Install the check tools
-        run: pip install -r requirements-dev.txt
+      # 3. Install the scraper's own libraries (requirements.txt) and the
+      #    check tools (requirements-dev.txt). The tests import functions
+      #    from the scraper, and the scraper's first lines import selenium
+      #    and bs4, so those must be installed even though no browser is
+      #    ever started.
+      - name: Install the scraper's libraries and the check tools
+        run: pip install -r requirements.txt -r requirements-dev.txt
 
       # 4. Lint: read every .py file and report mistakes. If ruff finds any,
       #    it exits with an error, this step fails, and the run shows a red X.
       - name: Lint with ruff
         run: ruff check .
+
+      # 5. Tests: pytest runs every test_ function in the tests/ folder.
+      #    If any assert fails, pytest exits with an error and the run is red.
+      #    The tests use saved data only: no network, Chrome or Finviz.
+      - name: Run tests with pytest
+        run: pytest

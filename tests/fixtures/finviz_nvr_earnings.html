@@ -1,0 +1,69 @@
+<!--
+  Test fixture: a TRIMMED copy of Finviz's earnings page for NVR,
+  captured from https://finviz.com/stock?t=NVR&ty=ea&p=d on 2026-11-12.
+
+  Only the parts the scraper's parsers read are kept: the four
+  "js-financials-widget" boxes (EPS, GAAP EPS, Revenue, Price Reaction),
+  their tables, and the few CSS classes the parsers look for
+  ("pr-0.5", "flex", "justify-between", "items-center"). Charts, scripts,
+  styling and all other attributes were removed; the Price Reaction table
+  keeps only its two newest reports.
+
+  NVR was chosen on purpose: its prices are above 1,000, so Finviz writes
+  them with a comma ("5,828.00") — the case that exposed the comma bug.
+
+  Never edit the numbers by hand: tests compare against them. To refresh,
+  capture a new page and update the expected values in the tests.
+-->
+
+<div class="js-financials-widget"><h4>EPS Performance and Forecast</h4>
+<table>
+<thead>
+<tr><th>Currency: USD</th><th>Q4 '24</th><th>Q1 '25</th><th>Q2 '25</th><th>Q3 '25</th><th>Q4 '25</th><th>Q1 '26</th><th>Q2 '26</th><th>Q3 '26</th><th>Q4 '26</th><th>Q1 '27</th><th>Q2 '27</th><th>Q3 '27</th></tr></thead>
+<tbody>
+<tr><td><label class="flex items-center"><div class="flex"></div><span>Estimate</span></label></td><td><span>129.35</span></td><td><span>106.07</span></td><td><span>106.20</span></td><td><span>109.36</span></td><td><span>105.91</span></td><td><span>77.39</span></td><td><span>89.98</span></td><td><span>102.77</span></td><td><span>96.40</span></td><td><span>62.92</span></td><td><span>83.84</span></td><td><span>95.06</span></td></tr>
+<tr><td># of Analysts</td><td><span>6</span></td><td><span>5</span></td><td><span>5</span></td><td><span>4</span></td><td><span>6</span></td><td><span>7</span></td><td><span>5</span></td><td><span>7</span></td><td><span>7</span></td><td><span>5</span></td><td><span>5</span></td><td><span>5</span></td></tr></tbody>
+<tbody>
+<tr><td><label class="flex items-center"><div class="flex"></div><span>Reported</span></label></td><td><span>139.93</span></td><td><span>94.83</span></td><td><span>108.54</span></td><td><span>112.33</span></td><td><span>121.54</span></td><td><span>67.76</span></td><td><span>83.96</span></td><td><span>89.45</span></td><td><span>—</span></td><td><span>—</span></td><td><span>—</span></td><td><span>—</span></td></tr></tbody>
+<tbody>
+<tr><td><label class="flex items-center"><div class="flex"></div><span>Surprise</span></label></td><td><span><span>10.58<br/><span>8.18%</span></span><span></span></span></td><td><span><span>-11.24<br/><span>-10.60%</span></span><span></span></span></td><td><span><span>2.34<br/><span>2.20%</span></span><span></span></span></td><td><span><span>2.97<br/><span>2.72%</span></span><span></span></span></td><td><span><span>15.63<br/><span>14.76%</span></span><span></span></span></td><td><span><span>-9.63<br/><span>-12.45%</span></span><span></span></span></td><td><span><span>-6.02<br/><span>-6.69%</span></span><span></span></span></td><td><span><span>-13.32<br/><span>-12.96%</span></span><span></span></span></td><td><span>—</span></td><td><span>—</span></td><td><span>—</span></td><td><span>—</span></td></tr></tbody>
+</table></div>
+<div class="js-financials-widget"><h4>GAAP EPS Performance and Forecast</h4>
+<table>
+<thead>
+<tr><th>Currency: USD</th><th>Q4 '24</th><th>Q1 '25</th><th>Q2 '25</th><th>Q3 '25</th><th>Q4 '25</th><th>Q1 '26</th><th>Q2 '26</th><th>Q3 '26</th><th>Q4 '26</th><th>Q1 '27</th><th>Q2 '27</th><th>Q3 '27</th></tr></thead>
+<tbody>
+<tr><td><label class="flex items-center"><div class="flex"></div><span>Estimate</span></label></td><td><span>129.35</span></td><td><span>106.07</span></td><td><span>106.20</span></td><td><span>109.36</span></td><td><span>105.91</span></td><td><span>77.39</span></td><td><span>89.98</span></td><td><span>102.77</span></td><td><span>96.40</span></td><td><span>62.92</span></td><td><span>83.84</span></td><td><span>95.06</span></td></tr>
+<tr><td># of Analysts</td><td><span>6</span></td><td><span>5</span></td><td><span>5</span></td><td><span>4</span></td><td><span>6</span></td><td><span>7</span></td><td><span>5</span></td><td><span>7</span></td><td><span>7</span></td><td><span>5</span></td><td><span>5</span></td><td><span>5</span></td></tr></tbody>
+<tbody>
+<tr><td><label class="flex items-center"><div class="flex"></div><span>Reported</span></label></td><td><span>139.93</span></td><td><span>94.83</span></td><td><span>108.54</span></td><td><span>112.33</span></td><td><span>121.56</span></td><td><span>67.76</span></td><td><span>83.96</span></td><td><span>89.45</span></td><td><span>—</span></td><td><span>—</span></td><td><span>—</span></td><td><span>—</span></td></tr></tbody>
+<tbody>
+<tr><td><label class="flex items-center"><div class="flex"></div><span>Surprise</span></label></td><td><span><span>10.58<br/><span>8.18%</span></span><span></span></span></td><td><span><span>-11.24<br/><span>-10.60%</span></span><span></span></span></td><td><span><span>2.33<br/><span>2.20%</span></span><span></span></span></td><td><span><span>2.97<br/><span>2.72%</span></span><span></span></span></td><td><span><span>15.65<br/><span>14.78%</span></span><span></span></span></td><td><span><span>-9.64<br/><span>-12.45%</span></span><span></span></span></td><td><span><span>-6.02<br/><span>-6.69%</span></span><span></span></span></td><td><span><span>-13.32<br/><span>-12.96%</span></span><span></span></span></td><td><span>—</span></td><td><span>—</span></td><td><span>—</span></td><td><span>—</span></td></tr></tbody>
+</table></div>
+<div class="js-financials-widget"><h4>Revenue Performance and Forecast</h4>
+<table>
+<thead>
+<tr><th>Currency: USD</th><th>Q4 '24</th><th>Q1 '25</th><th>Q2 '25</th><th>Q3 '25</th><th>Q4 '25</th><th>Q1 '26</th><th>Q2 '26</th><th>Q3 '26</th><th>Q4 '26</th><th>Q1 '27</th><th>Q2 '27</th><th>Q3 '27</th></tr></thead>
+<tbody>
+<tr><td><label class="flex items-center"><div class="flex"></div><span>Estimate</span></label></td><td><span>2.81B</span></td><td><span>2.36B</span></td><td><span>2.50B</span></td><td><span>2.55B</span></td><td><span>2.48B</span></td><td><span>2.05B</span></td><td><span>2.40B</span></td><td><span>2.57B</span></td><td><span>2.45B</span></td><td><span>2.02B</span></td><td><span>2.34B</span></td><td><span>2.47B</span></td></tr>
+<tr><td># of Analysts</td><td><span>6</span></td><td><span>5</span></td><td><span>5</span></td><td><span>4</span></td><td><span>6</span></td><td><span>7</span></td><td><span>5</span></td><td><span>6</span></td><td><span>6</span></td><td><span>2</span></td><td><span>2</span></td><td><span>2</span></td></tr></tbody>
+<tbody>
+<tr><td><label class="flex items-center"><div class="flex"></div><span>Reported</span></label></td><td><span>2.85B</span></td><td><span>2.40B</span></td><td><span>2.60B</span></td><td><span>2.61B</span></td><td><span>2.71B</span></td><td><span>1.88B</span></td><td><span>2.33B</span></td><td><span>2.40B</span></td><td><span>—</span></td><td><span>—</span></td><td><span>—</span></td><td><span>—</span></td></tr></tbody>
+<tbody>
+<tr><td><label class="flex items-center"><div class="flex"></div><span>Surprise</span></label></td><td><span><span>34.20M<br/><span>1.22%</span></span><span></span></span></td><td><span><span>48.01M<br/><span>2.04%</span></span><span></span></span></td><td><span><span>96.36M<br/><span>3.85%</span></span><span></span></span></td><td><span><span>55.79M<br/><span>2.18%</span></span><span></span></span></td><td><span><span>234.34M<br/><span>9.46%</span></span><span></span></span></td><td><span><span>-166.44M<br/><span>-8.13%</span></span><span></span></span></td><td><span><span>-70.94M<br/><span>-2.96%</span></span><span></span></span></td><td><span><span>-163.63M<br/><span>-6.38%</span></span><span></span></span></td><td><span>—</span></td><td><span>—</span></td><td><span>—</span></td><td><span>—</span></td></tr></tbody>
+</table></div>
+<div class="js-financials-widget"><div id="price-reaction-table">Price Reaction to Earnings Reports</div>
+<table>
+<thead>
+<tr><th>Report Date</th><th>-3 Days</th><th>-2 Days</th><th>-1 Day</th><th></th><th>Open</th><th>High</th><th>Low</th><th>Close</th><th></th><th>+1 Day</th><th>+2 Days</th><th>+3 Days</th><th>+1 Week</th><th>-1 Week</th></tr></thead>
+<tbody>
+<tr><td><div class="flex items-center"><div class="pr-0.5">Oct 22, 2026 BMO</div><a class="flex items-center"><span></span></a></div></td><td><span>5,828.00</span></td><td><span>5,977.67</span></td><td><span>5,900.00</span></td><td></td><td><span>5,760.22</span></td><td><span>6,118.77</span></td><td><span>5,550.00</span></td><td><span>6,110.63</span></td><td></td><td><span>5,983.68</span></td><td><span>5,727.77</span></td><td><span>5,806.02</span></td><td><span>6,018.95</span></td><td><span>5,940.83</span></td></tr>
+<tr><td><div class="flex justify-between"><div>Q3 ‘26<span>(Sep ‘26)</span></div><div>NVR %</div></div></td><td><span><span>-1.55%</span><span></span></span></td><td><span><span>+2.57%</span><span></span></span></td><td><span><span>-1.30%</span><span></span></span></td><td></td><td><div class="flex"><div>-2.37%</div></div></td><td><div class="flex"><div>+3.71%</div></div></td><td><div class="flex"><div>-5.93%</div></div></td><td><div class="flex"><div>+3.57%</div></div></td><td></td><td><span><span>-2.08%</span><span></span></span></td><td><span><span>-4.28%</span><span></span></span></td><td><span><span>+1.37%</span><span></span></span></td><td><span><span>+3.91%</span><span></span></span></td><td><span><span>+3.62%</span><span></span></span></td></tr>
+<tr><td><div class="flex justify-between"><div class="flex items-center"><div>RSI</div><div>45</div></div><div>SPY %</div></div></td><td><span><span>+0.42%</span><span></span></span></td><td><span><span>+0.34%</span><span></span></span></td><td><span><span>+0.53%</span><span></span></span></td><td></td><td><span><span>-0.87%</span><span></span></span></td><td><span><span>-0.70%</span><span></span></span></td><td><span><span>-1.54%</span><span></span></span></td><td><span><span>-1.18%</span><span></span></span></td><td></td><td><span><span>-0.52%</span><span></span></span></td><td><span><span>+0.71%</span><span></span></span></td><td><span><span>+0.56%</span><span></span></span></td><td><span><span>-0.38%</span><span></span></span></td><td><span><span>+0.28%</span><span></span></span></td></tr></tbody>
+<tbody>
+<tr><td><div class="flex items-center"><div class="pr-0.5">Jul 23, 2026 BMO</div><a class="flex items-center"><span></span></a></div></td><td><span>6,446.65</span></td><td><span>6,325.40</span></td><td><span>6,349.28</span></td><td></td><td><span>6,176.00</span></td><td><span>6,272.88</span></td><td><span>5,919.25</span></td><td><span>6,155.02</span></td><td></td><td><span>6,414.67</span></td><td><span>6,311.54</span></td><td><span>6,471.37</span></td><td><span>6,288.68</span></td><td><span>6,701.10</span></td></tr>
+<tr><td><div class="flex justify-between"><div>Q2 ‘26<span>(Jun ‘26)</span></div><div>NVR %</div></div></td><td><span><span>-0.67%</span><span></span></span></td><td><span><span>-1.88%</span><span></span></span></td><td><span><span>+0.38%</span><span></span></span></td><td></td><td><div class="flex"><div>-2.73%</div></div></td><td><div class="flex"><div>-1.20%</div></div></td><td><div class="flex"><div>-6.77%</div></div></td><td><div class="flex"><div>-3.06%</div></div></td><td></td><td><span><span>+4.22%</span><span></span></span></td><td><span><span>-1.61%</span><span></span></span></td><td><span><span>+2.53%</span><span></span></span></td><td><span><span>-1.46%</span><span></span></span></td><td><span><span>+3.13%</span><span></span></span></td></tr>
+<tr><td><div class="flex justify-between"><div class="flex items-center"><div>RSI</div><div>45</div></div><div>SPY %</div></div></td><td><span><span>-0.16%</span><span></span></span></td><td><span><span>+0.83%</span><span></span></span></td><td><span><span>-0.12%</span><span></span></span></td><td></td><td><span><span>-1.08%</span><span></span></span></td><td><span><span>-0.65%</span><span></span></span></td><td><span><span>-1.63%</span><span></span></span></td><td><span><span>-1.23%</span><span></span></span></td><td></td><td><span><span>+0.10%</span><span></span></span></td><td><span><span>+0.02%</span><span></span></span></td><td><span><span>+0.24%</span><span></span></span></td><td><span><span>+1.68%</span><span></span></span></td><td><span><span>-0.54%</span><span></span></span></td></tr></tbody>
+<tfoot>
+<tr><td colspan="15">Daily change and RSI 14 are based on the report date for BMO releases and the following day for AMC releases.</td></tr></tfoot>
+</table></div>

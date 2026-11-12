@@ -313,7 +313,9 @@ def parse_number(value: Optional[str]) -> Optional[float]:
     ("32.42"), and RSI ("72"). Returns None for empty/placeholder values."""
     if value in (None, "", "\u2014", "-"):
         return None
-    v = value.strip()
+    # Finviz writes 1,000 and above with commas ("5,828.00"); float() can't
+    # read a comma, so remove them first.
+    v = value.strip().replace(",", "")
     negative = v.startswith("-")
     v = v.lstrip("+-")
     multiplier = 1.0
@@ -336,7 +338,7 @@ def parse_percent(value: Optional[str]) -> Optional[float]:
     fraction — decide at read time whether you want to divide by 100."""
     if value in (None, "", "\u2014", "-"):
         return None
-    v = value.strip().rstrip("%")
+    v = value.strip().rstrip("%").replace(",", "")  # "1,234.56%" -> "1234.56"
     negative = v.startswith("-")
     v = v.lstrip("+-")
     multiplier = 1.0
