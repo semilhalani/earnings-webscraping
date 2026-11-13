@@ -2,7 +2,8 @@
 #
 # This workflow is separate from scrape-earnings.yml. It never runs the
 # scraper and never touches Finviz, Chrome or the Google Sheet. It reads
-# the code (lint) and runs the tests on saved data, in about a minute.
+# the code (lint) and runs the tests on saved data, in about a minute:
+# pytest for the Python scraper, and Node for the Apps Script receiver.
 name: CI
 
 # WHEN it runs: on every push to any branch, and whenever a pull request is
@@ -56,3 +57,15 @@ jobs:
       #    The tests use saved data only: no network, Chrome or Finviz.
       - name: Run tests with pytest
         run: pytest
+
+      # 6. Tests for the Apps Script receiver (finviz_data_receiver.gs). It is
+      #    JavaScript, so it is tested with Node, which GitHub's Ubuntu machine
+      #    already has. The test loads the real .gs file and checks it against
+      #    the same cases as the Python tests.
+      #    `if: !cancelled()` runs this step even when pytest failed, so one
+      #    red run shows every failure at once. The run is still red overall.
+      - name: Test the Apps Script receiver with Node
+        if: ${{ !cancelled() }}
+        run: |
+          node --version
+          node --test tests/receiver.test.js
