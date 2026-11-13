@@ -1,6 +1,24 @@
 /**
  * finviz_data_receiver.gs
  *
+ * NEWEST CHANGE (2026-11, "refresh" mode): the four data tabs no longer
+ * freeze rows. On every sweep each row Finviz still shows is COMPARED
+ * with the sheet and rewritten only if a value really changed. A value
+ * is never replaced with a blank: the old value is kept and the cell is
+ * listed in Raw_DataFlags (KEPT_OLD_VALUE). A non-zero value that becomes
+ * 0 is written and also listed (CHANGED_TO_ZERO). A flag row is deleted
+ * by itself once Finviz shows a normal value again. last_updated now
+ * means "when a value in this row last changed", not "last checked".
+ * The rule lives in mergeRow_() and the flag bookkeeping in
+ * applyFlagChanges_(); both are tested in CI (tests/receiver.test.js)
+ * against the same cases as the Python copy (tests/fixtures/
+ * refresh_cases.json). The old 'finalize' mode still works, so scraper
+ * runs that started before this version was deployed keep working.
+ *
+ * DEPLOY: Deploy > Manage deployments > edit (pencil) the EXISTING
+ * deployment > Version: New version > Deploy. Never "New deployment":
+ * that would create a new URL and the scraper would keep using the old.
+ *
  * ALSO IN THIS VERSION: quarterSortKey_() (used only by the one-time
  * backfillQuarterSort() helper near the bottom) now recognizes
  * semi-annual (S1/S2, H1/H2) and annual (FY) reporting periods, not
@@ -87,9 +105,12 @@ function doPost(e) {
     var headers = payload.headers;
     var keyColumns = payload.key_columns || ['ticker', 'quarter'];
     var finalizeColumn = payload.finalize_column || null;
-    // mode: 'finalize' (default) is the existing earnings-data behavior
-    // — an existing row is only updated if finalizeColumn is still
-    // blank, and never touched again once it holds a real value.
+    // mode: 'refresh' is what the four data tabs use since 2026-11: every
+    // existing row is compared with the incoming one and rewritten only if
+    // a value changed (see mergeRow_). 'finalize' is the older behavior,
+    // kept so runs started before this deploy still work — an existing
+    // row is only updated if finalizeColumn is still blank, and never
+    // touched again once it holds a real value.
     // 'overwrite' is new: an existing row (matched by keyColumns) is
     // ALWAYS replaced with the incoming data, no blank-check. Used only
     // for the ScraperProgress row, which needs to be updated every
@@ -115,7 +136,27 @@ function doPost(e) {
       clearDataRows_(sheet);
     }
 
-    var result = upsertRows_(sheet, headers, newRows, keyColumns, finalizeColumn, mode);
+    // Sheets keeps date cells in the spreadsheet's own time zone; dates are
+    // compared in that zone (see dateText_) so a date never looks "changed"
+    // just because Apps Script runs in a different zone.
+    SPREADSHEET_TIME_ZONE_ = ss.getSpreadsheetTimeZone();
+
+    var flagsSheet = null;
+    if (mode === 'refresh') {
+      flagsSheet = ss.getSheetByName(FLAGS_SHEET_NAME) || ss.insertSheet(FLAGS_SHEET_NAME);
+    }
+
+    var result = upsertRows_(sheet, headers, newRows, keyColumns, finalizeColumn, mode, flagsSheet);
+
+    // header_notes: {column: text} — a short explanation shown when you
+    // hover over that column's header cell (for example what last_updated
+    // means). Only rewritten when the text differs.
+    if (payload.header_notes) {
+      setHeaderNotes_(sheet, payload.header_notes);
+    }
+    if (flagsSheet && flagsSheet.getLastRow() > 0) {
+      setHeaderNotes_(flagsSheet, FLAG_NOTES);
+    }
     // NOTE: sorting used to happen HERE, after every single write. Removed
     // deliberately — see sortAllDataSheets_() near the bottom of this file
     // for why and where sorting happens now. This was the real cause of a
@@ -132,6 +173,9 @@ function doPost(e) {
       sheet: sheetName,
       appended: result.appended,
       updated: result.updated,
+      flags_open: result.flags_open,
+      flags_new: result.flags_new,
+      flags_resolved: result.flags_resolved,
     })).setMimeType(ContentService.MimeType.JSON);
 
   } catch (err) {
@@ -313,7 +357,7 @@ function ensureHeaders_(sheet, headers) {
   return { headerRow: existingHeaders, headerIndex: headerIndex };
 }
 
-function upsertRows_(sheet, headers, newRows, keyColumns, finalizeColumn, mode) {
+function upsertRows_(sheet, headers, newRows, keyColumns, finalizeColumn, mode, flagsSheet) {
   var schema = ensureHeaders_(sheet, headers);
   var headerIndex = schema.headerIndex;
   var numCols = schema.headerRow.length;
@@ -341,6 +385,27 @@ function upsertRows_(sheet, headers, newRows, keyColumns, finalizeColumn, mode) 
   var rowsToAppend = [];
   var updates = []; // { rowNum (1-indexed sheet row), values }
 
+  // Refresh mode only: the columns that are compared (everything except
+  // the key columns and last_updated), plus the flags already open for
+  // this tab, grouped by row key: { "AAPL|Q3 '26": { reported: "KEPT_OLD_VALUE" } }.
+  var sheetName = sheet.getName();
+  var compareColumns = headers.filter(function (h) {
+    return keyColumns.indexOf(h) === -1 && h !== 'last_updated';
+  });
+  var flagRows = [];
+  var openFlagsByKey = {};
+  var sightings = [];
+  var resolutions = [];
+  if (mode === 'refresh' && flagsSheet) {
+    flagRows = readFlagRows_(flagsSheet);
+    flagRows.forEach(function (f) {
+      if (f.sheet !== sheetName) return;
+      var k = String(f.ticker || '') + '|' + String(f.quarter || '');
+      openFlagsByKey[k] = openFlagsByKey[k] || {};
+      openFlagsByKey[k][f.column] = f.flag;
+    });
+  }
+
   newRows.forEach(function (rowObj) {
     var key = keyColumns.map(function (k) { return String(rowObj[k] || ''); }).join('|');
 
@@ -356,6 +421,35 @@ function upsertRows_(sheet, headers, newRows, keyColumns, finalizeColumn, mode) 
     // — used only for ScraperProgress, which must update every checkpoint.
     if (mode === 'overwrite') {
       updates.push({ rowNum: i + 2, values: buildRowByName(rowObj, existingRow) });
+      return;
+    }
+
+    // mode 'refresh': compare, write only what changed, never blank out.
+    if (mode === 'refresh') {
+      var existingObj = {};
+      compareColumns.forEach(function (h) { existingObj[h] = existingRow[headerIndex[h]]; });
+      var res = mergeRow_(existingObj, rowObj, compareColumns, openFlagsByKey[key] || {});
+      var where = { sheet: sheetName, ticker: rowObj.ticker, quarter: rowObj.quarter };
+      res.flags.forEach(function (f) {
+        sightings.push({
+          sheet: where.sheet, ticker: where.ticker, quarter: where.quarter, column: f.column,
+          flag: f.flag, value_before: f.value_before, finviz_value: f.finviz_value,
+        });
+      });
+      res.resolved.forEach(function (column) {
+        resolutions.push({ sheet: where.sheet, ticker: where.ticker, quarter: where.quarter, column: column });
+      });
+      if (res.changed) {
+        var merged = existingRow.slice();
+        compareColumns.forEach(function (h) {
+          var v = res.values[h];
+          merged[headerIndex[h]] = (v === undefined || v === null) ? '' : v;
+        });
+        if ('last_updated' in headerIndex && rowObj.last_updated !== undefined) {
+          merged[headerIndex['last_updated']] = rowObj.last_updated;
+        }
+        updates.push({ rowNum: i + 2, values: merged });
+      }
       return;
     }
 
@@ -377,7 +471,241 @@ function upsertRows_(sheet, headers, newRows, keyColumns, finalizeColumn, mode) 
     sheet.getRange(u.rowNum, 1, 1, numCols).setValues([u.values]);
   });
 
-  return { appended: rowsToAppend.length, updated: updates.length };
+  var flagResult = { added: 0, resolved: 0 };
+  if (mode === 'refresh' && flagsSheet && (sightings.length || resolutions.length)) {
+    var now = (newRows[0] && newRows[0].last_updated) || new Date().toISOString();
+    flagResult = applyFlagChanges_(flagRows, sightings, resolutions, now);
+    if (flagResult.changed) writeFlagRows_(flagsSheet, flagResult.rows);
+  }
+
+  return {
+    appended: rowsToAppend.length,
+    updated: updates.length,
+    flags_open: sightings.length,
+    flags_new: flagResult.added,
+    flags_resolved: flagResult.resolved,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// The refresh rule. Pure functions: no Sheets calls, so CI can test them
+// with Node (tests/receiver.test.js). Python has an identical copy
+// (merge_row in finviz_earnings_scraper.py); both are checked against the
+// same cases in tests/fixtures/refresh_cases.json, so change both together.
+// ---------------------------------------------------------------------------
+
+var FLAGS_SHEET_NAME = 'Raw_DataFlags';
+var FLAG_HEADERS = ['sheet', 'ticker', 'quarter', 'column', 'flag', 'value_before', 'finviz_value',
+  'first_seen', 'last_seen', 'times_seen', 'days_open'];
+var FLAG_NOTES = {
+  flag: 'KEPT_OLD_VALUE = Finviz now shows this cell blank; the sheet kept its value (value_before). '
+    + 'CHANGED_TO_ZERO = Finviz changed a non-zero value to 0; the sheet now holds 0 and value_before '
+    + 'is what it was. A row here is deleted automatically once Finviz shows a normal value again.',
+  value_before: 'The value the sheet had when this problem was first seen.',
+  first_seen: 'The sweep that first saw this problem.',
+  last_seen: 'The latest sweep that still saw it. If this stops moving, Finviz no longer shows that quarter.',
+  times_seen: 'How many writes have seen this problem so far.',
+  days_open: 'Days between first_seen and last_seen.',
+};
+// Two numbers closer than this (relative to their size) are treated as
+// equal. It only absorbs computer rounding noise, like 124.30B being
+// stored as 124299999999.99998; the smallest change Finviz can display is
+// millions of times larger, so no real revision is ever skipped.
+var RELATIVE_TOLERANCE = 1e-9;
+var NUMBER_PATTERN = /^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/;
+var SPREADSHEET_TIME_ZONE_ = null; // set in doPost
+
+function isBlank_(v) {
+  return v === undefined || v === null || (typeof v === 'string' && v.trim() === '');
+}
+
+function isDate_(v) {
+  return Object.prototype.toString.call(v) === '[object Date]';
+}
+
+function asNumber_(v) {
+  if (typeof v === 'number') return isFinite(v) ? v : null;
+  if (typeof v === 'string' && NUMBER_PATTERN.test(v.trim())) return Number(v.trim());
+  return null;
+}
+
+function isZero_(v) {
+  return asNumber_(v) === 0;
+}
+
+function dateText_(d) {
+  if (SPREADSHEET_TIME_ZONE_ && typeof Utilities !== 'undefined') {
+    return Utilities.formatDate(d, SPREADSHEET_TIME_ZONE_, 'yyyy-MM-dd');
+  }
+  var pad = function (n) { return (n < 10 ? '0' : '') + n; };
+  return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
+}
+
+function valuesEqual_(a, b) {
+  if (isDate_(a)) a = dateText_(a);
+  if (isDate_(b)) b = dateText_(b);
+  var na = asNumber_(a), nb = asNumber_(b);
+  if (na !== null && nb !== null) {
+    if (na === nb) return true;
+    return Math.abs(na - nb) <= RELATIVE_TOLERANCE * Math.max(Math.abs(na), Math.abs(nb));
+  }
+  return String(a).trim() === String(b).trim();
+}
+
+/**
+ * Compares ONE existing row with what Finviz shows now.
+ *   existing:  {column: value as the sheet has it}   ('' = empty cell)
+ *   incoming:  {column: value the scraper just read} (null = blank on Finviz)
+ *   columns:   which columns to compare
+ *   openFlags: {column: flag type} already open for this row
+ * Returns {changed, values, flags, resolved}:
+ *   values   = what every compared column should hold afterwards
+ *   flags    = problems open after this sweep (new or still there)
+ *   resolved = columns whose open flag should now be deleted
+ */
+function mergeRow_(existing, incoming, columns, openFlags) {
+  var out = { changed: false, values: {}, flags: [], resolved: [] };
+  columns.forEach(function (c) {
+    var oldV = existing[c] === undefined ? '' : existing[c];
+    var open = openFlags[c];
+    if (!(c in incoming)) { out.values[c] = oldV; return; } // not sent: leave alone
+    var newV = incoming[c];
+
+    if (isBlank_(newV)) {
+      out.values[c] = oldV; // never replace a value with a blank
+      if (!isBlank_(oldV)) {
+        out.flags.push({ column: c, flag: 'KEPT_OLD_VALUE', value_before: oldV, finviz_value: '' });
+      } else if (open) {
+        out.resolved.push(c);
+      }
+      return;
+    }
+
+    if (!isBlank_(oldV) && valuesEqual_(oldV, newV)) {
+      out.values[c] = oldV; // same value: nothing to write
+      if (open === 'CHANGED_TO_ZERO' && isZero_(newV)) {
+        out.flags.push({ column: c, flag: 'CHANGED_TO_ZERO', value_before: oldV, finviz_value: newV });
+      } else if (open) {
+        out.resolved.push(c);
+      }
+      return;
+    }
+
+    out.values[c] = newV; // a real change (or an empty cell getting a value)
+    out.changed = true;
+    if (!isBlank_(oldV) && isZero_(newV) && !isZero_(oldV)) {
+      out.flags.push({ column: c, flag: 'CHANGED_TO_ZERO', value_before: oldV, finviz_value: newV });
+    } else if (open) {
+      out.resolved.push(c);
+    }
+  });
+  return out;
+}
+
+/**
+ * Updates the list of flag rows (plain objects, FLAG_HEADERS keys).
+ *   sightings:   problems seen in this write -> add, or refresh last_seen
+ *   resolutions: cells that are fine again   -> delete their flag row
+ * One flag per cell (sheet + ticker + quarter + column). If a cell's flag
+ * changes type, it starts over as a new problem. value_before always keeps
+ * the value from when the problem was FIRST seen.
+ * Returns {rows, added, resolved, changed}.
+ */
+function applyFlagChanges_(flagRows, sightings, resolutions, now) {
+  var cellKey = function (f) {
+    return [f.sheet, f.ticker, f.quarter, f.column].map(function (x) { return String(x || ''); }).join('|');
+  };
+  var rows = flagRows.map(function (r) { return Object.assign({}, r); });
+  var index = {};
+  rows.forEach(function (r, i) { index[cellKey(r)] = i; });
+  var added = 0, resolved = 0, changed = false;
+  var deleted = {};
+
+  resolutions.forEach(function (r) {
+    var k = cellKey(r);
+    if (k in index && !deleted[k]) { deleted[k] = true; resolved++; changed = true; }
+  });
+
+  sightings.forEach(function (s) {
+    var k = cellKey(s);
+    var i = index[k];
+    if (i !== undefined && !deleted[k] && rows[i].flag === s.flag) {
+      rows[i].last_seen = now;
+      rows[i].finviz_value = s.finviz_value;
+      rows[i].times_seen = (Number(rows[i].times_seen) || 0) + 1;
+      rows[i].days_open = daysBetween_(rows[i].first_seen, now);
+    } else {
+      var fresh = {
+        sheet: s.sheet, ticker: s.ticker, quarter: s.quarter, column: s.column, flag: s.flag,
+        value_before: s.value_before, finviz_value: s.finviz_value,
+        first_seen: now, last_seen: now, times_seen: 1, days_open: 0,
+      };
+      if (i !== undefined && !deleted[k]) {
+        rows[i] = fresh; // same cell, different problem: start over
+      } else {
+        index[k] = rows.length;
+        rows.push(fresh);
+        delete deleted[k];
+      }
+      added++;
+    }
+    changed = true;
+  });
+
+  var kept = rows.filter(function (r) { return !deleted[cellKey(r)]; });
+  return { rows: kept, added: added, resolved: resolved, changed: changed };
+}
+
+function daysBetween_(from, to) {
+  var a = isDate_(from) ? from.getTime() : Date.parse(from);
+  var b = isDate_(to) ? to.getTime() : Date.parse(to);
+  if (isNaN(a) || isNaN(b)) return '';
+  return Math.round((b - a) / 86400000 * 10) / 10; // one decimal
+}
+
+/** Reads Raw_DataFlags into plain objects (creating its header row if new). */
+function readFlagRows_(flagsSheet) {
+  var schema = ensureHeaders_(flagsSheet, FLAG_HEADERS);
+  var lastRow = flagsSheet.getLastRow();
+  if (lastRow < 2) return [];
+  var values = flagsSheet.getRange(2, 1, lastRow - 1, schema.headerRow.length).getValues();
+  return values.map(function (row) {
+    var obj = {};
+    schema.headerRow.forEach(function (h, i) { obj[h] = row[i]; });
+    return obj;
+  });
+}
+
+/** Rewrites Raw_DataFlags' data rows in one go (it is small: one row per open problem). */
+function writeFlagRows_(flagsSheet, rows) {
+  var schema = ensureHeaders_(flagsSheet, FLAG_HEADERS);
+  clearDataRows_(flagsSheet);
+  if (rows.length === 0) return;
+  var values = rows.map(function (r) {
+    return schema.headerRow.map(function (h) {
+      var v = r[h];
+      return (v === undefined || v === null) ? '' : v;
+    });
+  });
+  flagsSheet.getRange(2, 1, values.length, schema.headerRow.length).setValues(values);
+}
+
+/** Puts a hover note on header cells, e.g. what last_updated means. */
+function setHeaderNotes_(sheet, notes) {
+  var lastCol = sheet.getLastColumn();
+  if (!lastCol) return;
+  var range = sheet.getRange(1, 1, 1, lastCol);
+  var header = range.getValues()[0];
+  var current = range.getNotes()[0];
+  var next = current.slice();
+  var changed = false;
+  header.forEach(function (h, i) {
+    if (Object.prototype.hasOwnProperty.call(notes, h) && current[i] !== notes[h]) {
+      next[i] = notes[h];
+      changed = true;
+    }
+  });
+  if (changed) range.setNotes([next]);
 }
 
 /**
