@@ -1,0 +1,192 @@
+{
+  "_about": [
+    "Shared test cases for the refresh rule: how ONE existing row is compared with what Finviz shows now.",
+    "The SAME cases are checked against the Python version (merge_row, tests/test_refresh_rule.py)",
+    "and the Apps Script version (mergeRow_, tests/receiver.test.js), so the two can never quietly disagree.",
+    "existing = the row as the sheet has it ('' = empty cell). incoming = what the scraper just read (null = blank on Finviz).",
+    "open_flags = flags already in Raw_DataFlags for this row. expected.values = what each column should hold afterwards.",
+    "expected.flags = flags still/now open after this sweep. expected.resolved = columns whose flag should be deleted."
+  ],
+  "cases": [
+    {
+      "name": "everything the same: nothing to write",
+      "columns": ["estimate", "reported"],
+      "existing": {"estimate": 6.5, "reported": 6.77},
+      "incoming": {"estimate": 6.5, "reported": 6.77},
+      "open_flags": {},
+      "expected": {"changed": false, "values": {"estimate": 6.5, "reported": 6.77}, "flags": [], "resolved": []}
+    },
+    {
+      "name": "Finviz revised a reported value (AAPL GAAP Q3 '26): update it",
+      "columns": ["estimate", "reported"],
+      "existing": {"estimate": 6.5, "reported": 6.77},
+      "incoming": {"estimate": 6.5, "reported": 6.98},
+      "open_flags": {},
+      "expected": {"changed": true, "values": {"estimate": 6.5, "reported": 6.98}, "flags": [], "resolved": []}
+    },
+    {
+      "name": "a quarter just reported (empty cell gets a value): update, no flag",
+      "columns": ["estimate", "reported"],
+      "existing": {"estimate": 102.77, "reported": ""},
+      "incoming": {"estimate": 102.77, "reported": 89.45},
+      "open_flags": {},
+      "expected": {"changed": true, "values": {"estimate": 102.77, "reported": 89.45}, "flags": [], "resolved": []}
+    },
+    {
+      "name": "Finviz now shows blank where we have a value: keep ours and flag it",
+      "columns": ["estimate", "reported"],
+      "existing": {"estimate": 6.5, "reported": 6.77},
+      "incoming": {"estimate": 6.5, "reported": null},
+      "open_flags": {},
+      "expected": {"changed": false, "values": {"estimate": 6.5, "reported": 6.77},
+                   "flags": [{"column": "reported", "flag": "KEPT_OLD_VALUE", "value_before": 6.77, "finviz_value": ""}],
+                   "resolved": []}
+    },
+    {
+      "name": "Finviz still shows blank on a later sweep: flag stays open",
+      "columns": ["reported"],
+      "existing": {"reported": 6.77},
+      "incoming": {"reported": null},
+      "open_flags": {"reported": "KEPT_OLD_VALUE"},
+      "expected": {"changed": false, "values": {"reported": 6.77},
+                   "flags": [{"column": "reported", "flag": "KEPT_OLD_VALUE", "value_before": 6.77, "finviz_value": ""}],
+                   "resolved": []}
+    },
+    {
+      "name": "Finviz shows the value again, unchanged: flag is resolved",
+      "columns": ["reported"],
+      "existing": {"reported": 6.77},
+      "incoming": {"reported": 6.77},
+      "open_flags": {"reported": "KEPT_OLD_VALUE"},
+      "expected": {"changed": false, "values": {"reported": 6.77}, "flags": [], "resolved": ["reported"]}
+    },
+    {
+      "name": "Finviz shows a new value after a blank: update and resolve the flag",
+      "columns": ["reported"],
+      "existing": {"reported": 6.77},
+      "incoming": {"reported": 6.98},
+      "open_flags": {"reported": "KEPT_OLD_VALUE"},
+      "expected": {"changed": true, "values": {"reported": 6.98}, "flags": [], "resolved": ["reported"]}
+    },
+    {
+      "name": "blank on both sides: nothing to do",
+      "columns": ["reported"],
+      "existing": {"reported": ""},
+      "incoming": {"reported": null},
+      "open_flags": {},
+      "expected": {"changed": false, "values": {"reported": ""}, "flags": [], "resolved": []}
+    },
+    {
+      "name": "a non-zero value becomes 0: write the 0 and flag it",
+      "columns": ["surprise"],
+      "existing": {"surprise": 0.52},
+      "incoming": {"surprise": 0},
+      "open_flags": {},
+      "expected": {"changed": true, "values": {"surprise": 0},
+                   "flags": [{"column": "surprise", "flag": "CHANGED_TO_ZERO", "value_before": 0.52, "finviz_value": 0}],
+                   "resolved": []}
+    },
+    {
+      "name": "the 0 is still there on a later sweep: flag stays open",
+      "columns": ["surprise"],
+      "existing": {"surprise": 0},
+      "incoming": {"surprise": 0},
+      "open_flags": {"surprise": "CHANGED_TO_ZERO"},
+      "expected": {"changed": false, "values": {"surprise": 0},
+                   "flags": [{"column": "surprise", "flag": "CHANGED_TO_ZERO", "value_before": 0, "finviz_value": 0}],
+                   "resolved": []}
+    },
+    {
+      "name": "the 0 becomes a real number again: update and resolve the flag",
+      "columns": ["surprise"],
+      "existing": {"surprise": 0},
+      "incoming": {"surprise": 0.48},
+      "open_flags": {"surprise": "CHANGED_TO_ZERO"},
+      "expected": {"changed": true, "values": {"surprise": 0.48}, "flags": [], "resolved": ["surprise"]}
+    },
+    {
+      "name": "an empty cell gets a real 0 (exactly on estimate): update, no flag",
+      "columns": ["surprise"],
+      "existing": {"surprise": ""},
+      "incoming": {"surprise": 0},
+      "open_flags": {},
+      "expected": {"changed": true, "values": {"surprise": 0}, "flags": [], "resolved": []}
+    },
+    {
+      "name": "a 0 that was always 0 (no flag open): nothing to do",
+      "columns": ["surprise"],
+      "existing": {"surprise": 0},
+      "incoming": {"surprise": 0},
+      "open_flags": {},
+      "expected": {"changed": false, "values": {"surprise": 0}, "flags": [], "resolved": []}
+    },
+    {
+      "name": "a blanked value later shows as 0: the flag switches to CHANGED_TO_ZERO",
+      "columns": ["surprise"],
+      "existing": {"surprise": 0.52},
+      "incoming": {"surprise": 0},
+      "open_flags": {"surprise": "KEPT_OLD_VALUE"},
+      "expected": {"changed": true, "values": {"surprise": 0},
+                   "flags": [{"column": "surprise", "flag": "CHANGED_TO_ZERO", "value_before": 0.52, "finviz_value": 0}],
+                   "resolved": []}
+    },
+    {
+      "name": "computer rounding noise only (124.30B stored as 124299999999.99998): not a change",
+      "columns": ["reported"],
+      "existing": {"reported": 124299999999.99998},
+      "incoming": {"reported": 124300000000.0},
+      "open_flags": {},
+      "expected": {"changed": false, "values": {"reported": 124299999999.99998}, "flags": [], "resolved": []}
+    },
+    {
+      "name": "the smallest real revision Finviz can show (2.40B to 2.41B): a change",
+      "columns": ["reported"],
+      "existing": {"reported": 2400000000.0},
+      "incoming": {"reported": 2410000000.0},
+      "open_flags": {},
+      "expected": {"changed": true, "values": {"reported": 2410000000.0}, "flags": [], "resolved": []}
+    },
+    {
+      "name": "a 0.01 EPS revision: a change",
+      "columns": ["reported"],
+      "existing": {"reported": 1.48},
+      "incoming": {"reported": 1.49},
+      "open_flags": {},
+      "expected": {"changed": true, "values": {"reported": 1.49}, "flags": [], "resolved": []}
+    },
+    {
+      "name": "a number stored as text in the sheet equals the same number: not a change",
+      "columns": ["estimate", "quarter_sort"],
+      "existing": {"estimate": "102.77", "quarter_sort": "263"},
+      "incoming": {"estimate": 102.77, "quarter_sort": 263},
+      "open_flags": {},
+      "expected": {"changed": false, "values": {"estimate": "102.77", "quarter_sort": "263"}, "flags": [], "resolved": []}
+    },
+    {
+      "name": "text columns: the report moved from before to after market",
+      "columns": ["report_date", "session"],
+      "existing": {"report_date": "2026-10-22", "session": "BMO"},
+      "incoming": {"report_date": "2026-10-23", "session": "AMC"},
+      "open_flags": {},
+      "expected": {"changed": true, "values": {"report_date": "2026-10-23", "session": "AMC"}, "flags": [], "resolved": []}
+    },
+    {
+      "name": "one value revised and another blanked in the same row",
+      "columns": ["price_close", "price_p1wk"],
+      "existing": {"price_close": 6110.63, "price_p1wk": 6018.95},
+      "incoming": {"price_close": 6115.0, "price_p1wk": null},
+      "open_flags": {},
+      "expected": {"changed": true, "values": {"price_close": 6115.0, "price_p1wk": 6018.95},
+                   "flags": [{"column": "price_p1wk", "flag": "KEPT_OLD_VALUE", "value_before": 6018.95, "finviz_value": ""}],
+                   "resolved": []}
+    },
+    {
+      "name": "a column the scraper did not send at all is left alone",
+      "columns": ["estimate", "reported"],
+      "existing": {"estimate": 6.5, "reported": 6.77},
+      "incoming": {"estimate": 6.5},
+      "open_flags": {},
+      "expected": {"changed": false, "values": {"estimate": 6.5, "reported": 6.77}, "flags": [], "resolved": []}
+    }
+  ]
+}

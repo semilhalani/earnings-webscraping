@@ -195,22 +195,34 @@ PRICE_HEADERS = (
     + ["last_updated"]
 )
 
-# A Post-Earnings-Moves row is only COMPLETE once "price_p1wk" (the price
-# one week after the report) exists — it is the last value in time, so if
-# it is filled, everything before it is too. Until then the row keeps
-# being refreshed on every sweep, exactly like the EPS/revenue tables
-# keep refreshing until "reported" arrives; after that it is frozen.
+# THE REFRESH RULE (2026-11). Rows are no longer frozen. On every sweep,
+# every quarter Finviz shows is compared with what the sheet already has:
+#   - new quarter                     -> added
+#   - every value the same            -> nothing written
+#   - a value changed                 -> the row is updated
+#   - Finviz now blank, we have one   -> ours is kept, flagged KEPT_OLD_VALUE
+#   - a non-zero value becomes 0      -> the 0 is written, flagged CHANGED_TO_ZERO
+#   - quarter no longer on Finviz     -> never touched again (kept as it is)
+# Flags go to the Raw_DataFlags tab (written by the Apps Script receiver,
+# which is the only side that can see the old value).
 #
-# WHY: price rows used to be written ONCE and never touched again
-# (finalize_column=None). That froze any row saved too early: Finviz shows
-# a placeholder row for an upcoming report days in advance, and a row
-# scraped on report day has none of the after-report prices yet. On
-# 2026-11-02, 2,520 of the 2,626 reports from Sep-Nov 2026 were missing
-# their one-week price for exactly this reason.
+# WHY: the old rule froze a row once "reported" (or, for price rows,
+# "price_p1wk") was filled. That kept wrong values forever: revisions
+# Finviz made later (AAPL GAAP EPS Q3 '26: saved 6.77, Finviz later 6.98)
+# and one-week prices scraped mid-day before the market closed (~284 rows).
 #
-# Known, accepted side effect: ~600 old rows where Finviz itself has no
-# one-week price will be harmlessly rewritten every sweep.
-PRICE_FINALIZE_COLUMN = "price_p1wk"
+# last_updated now means "when a value in this row last CHANGED". When a
+# ticker was last CHECKED is in the Raw_LastChecked tab (one row per ticker).
+REFRESH_MODE = "refresh"
+NOT_COMPARED_COLUMNS = ("ticker", "quarter", "last_updated")
+DATA_HEADER_NOTES = {
+    "last_updated": (
+        "When a value in this row last CHANGED (or the row was first added). "
+        "Rows are compared with Finviz on every sweep but only rewritten when "
+        "something changed, so an old date here can still be today's data. "
+        "Raw_LastChecked shows when each ticker was last checked."
+    ),
+}
 
 DATE_SESSION_PATTERN = re.compile(r"^(.*\d{4})\s+(BMO|AMC)$")
 
@@ -726,31 +738,117 @@ def scrape_ticker(ticker: str, headless: bool = True) -> Dict[str, List[Dict]]:
 # exactly what would land in the three Sheets tabs.
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# The refresh rule (see the comment above REFRESH_MODE). merge_row is the
+# Python copy of mergeRow_ in finviz_data_receiver.gs; CI checks both
+# against the same cases (tests/fixtures/refresh_cases.json), so if you
+# change one, change the other.
+# ---------------------------------------------------------------------------
+
+# Two numbers closer than this (relative to their size) count as equal. It
+# only absorbs computer rounding noise (124.30B stored as 124299999999.99998);
+# the smallest change Finviz can display is millions of times larger.
+RELATIVE_TOLERANCE = 1e-9
+_NUMBER_PATTERN = re.compile(r"^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$")
+
+
+def _is_blank(value) -> bool:
+    return value is None or (isinstance(value, str) and value.strip() == "")
+
+
+def _as_number(value) -> Optional[float]:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str) and _NUMBER_PATTERN.match(value.strip()):
+        return float(value.strip())
+    return None
+
+
+def _is_zero(value) -> bool:
+    return _as_number(value) == 0.0
+
+
+def values_equal(a, b) -> bool:
+    """Same value? Numbers are compared as numbers (so "102.77" == 102.77),
+    allowing only for rounding noise; anything else is compared as text."""
+    na, nb = _as_number(a), _as_number(b)
+    if na is not None and nb is not None:
+        return na == nb or abs(na - nb) <= RELATIVE_TOLERANCE * max(abs(na), abs(nb))
+    return str(a).strip() == str(b).strip()
+
+
+def merge_row(existing: Dict, incoming: Dict, columns, open_flags: Optional[Dict] = None) -> Dict:
+    """Compares ONE existing row with what Finviz shows now.
+
+    existing:   {column: value as stored}         ("" = empty cell)
+    incoming:   {column: value just scraped}      (None = blank on Finviz)
+    columns:    which columns to compare
+    open_flags: {column: flag type} already open for this row
+
+    Returns {"changed", "values", "flags", "resolved"}:
+      values   = what every compared column should hold afterwards
+      flags    = problems open after this sweep (new or still there)
+      resolved = columns whose open flag should now be deleted
+    """
+    open_flags = open_flags or {}
+    out = {"changed": False, "values": {}, "flags": [], "resolved": []}
+    for c in columns:
+        old = existing.get(c, "")
+        old = "" if old is None else old
+        is_open = open_flags.get(c)
+        if c not in incoming:
+            out["values"][c] = old  # not sent: leave alone
+            continue
+        new = incoming[c]
+
+        if _is_blank(new):
+            out["values"][c] = old  # never replace a value with a blank
+            if not _is_blank(old):
+                out["flags"].append({"column": c, "flag": "KEPT_OLD_VALUE",
+                                     "value_before": old, "finviz_value": ""})
+            elif is_open:
+                out["resolved"].append(c)
+            continue
+
+        if not _is_blank(old) and values_equal(old, new):
+            out["values"][c] = old  # same value: nothing to write
+            if is_open == "CHANGED_TO_ZERO" and _is_zero(new):
+                out["flags"].append({"column": c, "flag": "CHANGED_TO_ZERO",
+                                     "value_before": old, "finviz_value": new})
+            elif is_open:
+                out["resolved"].append(c)
+            continue
+
+        out["values"][c] = new  # a real change (or an empty cell getting a value)
+        out["changed"] = True
+        if not _is_blank(old) and _is_zero(new) and not _is_zero(old):
+            out["flags"].append({"column": c, "flag": "CHANGED_TO_ZERO",
+                                 "value_before": old, "finviz_value": new})
+        elif is_open:
+            out["resolved"].append(c)
+    return out
+
+
 def upsert_csv(
     path: str,
     headers: List[str],
     new_rows: List[Dict],
     key_columns=("ticker", "quarter"),
-    finalize_column: Optional[str] = None,
 ):
     """
-    Same upsert semantics as upsert_rows() (the Google Sheets version),
-    applied to a local CSV file. Safe to call repeatedly across separate
-    runs — reads the existing file if present, merges in memory, rewrites
-    the whole file. Returns (num_appended, num_updated).
+    The refresh rule (see REFRESH_MODE) applied to a local CSV file: the
+    preview copy saved with every run. Reads the existing file if present,
+    merges in memory, rewrites the whole file. Returns
+    (num_appended, num_updated).
 
-    Three cases per row:
     - Key not seen before -> appended.
-    - Key seen before, finalize_column=None -> left alone. (Price
-      Reaction used to use this; it now uses PRICE_FINALIZE_COLUMN —
-      see the comment on that constant for why.)
-    - Key seen before, finalize_column set (e.g. "reported") -> if the
-      EXISTING row's value in that column is still empty, the ENTIRE row
-      is refreshed with the new data (covers both "a forecast estimate
-      just got revised" and "this quarter just actually reported"). Once
-      that column holds a real value, the row is frozen forever — later
-      scrapes never touch it again, even if Finviz's displayed quarter
-      window later scrolls past it and stops showing it at all.
+    - Key seen before -> compared with merge_row(); rewritten only if a
+      value changed (last_updated then moves to this run). A blank never
+      erases a value. Flags are not kept here: the CSV is only a copy, and
+      Raw_DataFlags lives in the Google Sheet.
+    - Rows not in new_rows (quarters Finviz no longer shows) are kept.
     """
     existing_rows: List[Dict] = []
     if os.path.exists(path):
@@ -761,6 +859,7 @@ def upsert_csv(
         tuple(row.get(k, "") for k in key_columns): i
         for i, row in enumerate(existing_rows)
     }
+    compare_columns = [h for h in headers if h not in key_columns and h not in NOT_COMPARED_COLUMNS]
 
     appended = updated = 0
     for row_dict in new_rows:
@@ -771,15 +870,19 @@ def upsert_csv(
             existing_rows.append(row_str)
             existing_map[key] = len(existing_rows) - 1
             appended += 1
-        elif finalize_column:
-            idx = existing_map[key]
-            existing_val = existing_rows[idx].get(finalize_column, "")
-            if existing_val in ("", None):
-                existing_rows[idx] = row_str
-                updated += 1
+            continue
+
+        idx = existing_map[key]
+        result = merge_row(existing_rows[idx], row_dict, compare_columns)
+        if result["changed"]:
+            merged = dict(existing_rows[idx])
+            merged.update(result["values"])
+            merged["last_updated"] = row_str.get("last_updated", "")
+            existing_rows[idx] = merged
+            updated += 1
 
     with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=headers)
+        writer = csv.DictWriter(f, fieldnames=headers, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(_sort_rows_for_display(existing_rows))
 
@@ -825,10 +928,10 @@ def save_to_csvs(
     revenue_path = os.path.join(output_dir, "Raw_RevenueHistory.csv")
     price_path = os.path.join(output_dir, "Raw_PostEarningsMoves.csv")
 
-    a1, u1 = upsert_csv(eps_path, EPS_HEADERS, eps_rows, finalize_column="reported")
-    a2, u2 = upsert_csv(gaap_eps_path, GAAP_EPS_HEADERS, gaap_eps_rows, finalize_column="reported")
-    a3, u3 = upsert_csv(revenue_path, REVENUE_HEADERS, revenue_rows, finalize_column="reported")
-    a4, u4 = upsert_csv(price_path, PRICE_HEADERS, price_rows, finalize_column=PRICE_FINALIZE_COLUMN)
+    a1, u1 = upsert_csv(eps_path, EPS_HEADERS, eps_rows)
+    a2, u2 = upsert_csv(gaap_eps_path, GAAP_EPS_HEADERS, gaap_eps_rows)
+    a3, u3 = upsert_csv(revenue_path, REVENUE_HEADERS, revenue_rows)
+    a4, u4 = upsert_csv(price_path, PRICE_HEADERS, price_rows)
 
     print(f"  {eps_path}: +{a1} new, {u1} updated")
     print(f"  {gaap_eps_path}: +{a2} new, {u2} updated")
@@ -868,28 +971,17 @@ def upsert_rows(
     worksheet,
     new_rows: List[Dict],
     key_columns=("ticker", "quarter"),
-    finalize_column: Optional[str] = None,
 ):
     """
-    Writes new_rows into worksheet without duplicating existing (ticker,
-    quarter) rows.
+    Writes new_rows into a gspread worksheet with the refresh rule (see
+    REFRESH_MODE). This is the service-account route; the live GitHub runs
+    use the Apps Script receiver instead (write_via_webapp), which applies
+    the same rule and also records flags in Raw_DataFlags. This path does
+    not record flags.
 
     - A key not already present -> appended.
-    - A key already present, finalize_column=None -> left alone. (Price
-      Reaction used to use this; it now uses PRICE_FINALIZE_COLUMN —
-      see the comment on that constant for why.)
-    - A key already present, finalize_column set (e.g. "reported") -> if
-      the EXISTING row's value in that column is still empty, the ENTIRE
-      row is refreshed with the new data. This covers both "a forecast
-      estimate got revised since last scrape" and "this quarter just
-      actually reported." Once that column holds a real value, the row
-      is frozen forever and never touched again — even once Finviz's
-      displayed quarter window scrolls past it and stops showing it.
-
-    This is what lets you re-run the same tickers on a schedule
-    indefinitely: rows only ever grow or get refreshed while still
-    "open," never duplicated, and never lost once finalized — regardless
-    of which 12 quarters Finviz happens to be displaying on any given day.
+    - A key already present -> compared with merge_row(); rewritten only if
+      a value changed. A blank never erases a value.
 
     Returns (num_appended, num_updated).
     """
@@ -900,6 +992,7 @@ def upsert_rows(
     headers = all_values[0]
     header_index = {h: i for i, h in enumerate(headers)}
     key_idx = [header_index[k] for k in key_columns]
+    compare_columns = [h for h in headers if h not in key_columns and h not in NOT_COMPARED_COLUMNS]
 
     existing_map = {}
     for row_num, row in enumerate(all_values[1:], start=2):  # 1-indexed; +1 to skip header
@@ -911,24 +1004,20 @@ def upsert_rows(
 
     for row_dict in new_rows:
         key = tuple(str(row_dict.get(k, "")) for k in key_columns)
-        row_values = ["" if row_dict.get(h) is None else row_dict.get(h) for h in headers]
 
         if key not in existing_map:
-            rows_to_append.append(row_values)
+            rows_to_append.append(["" if row_dict.get(h) is None else row_dict.get(h) for h in headers])
             continue
-
-        if finalize_column is None:
-            continue  # already have it, nothing to do
 
         row_num = existing_map[key]
         existing_row = all_values[row_num - 1]
-        check_idx = header_index.get(finalize_column)
-        if check_idx is None:
-            continue
-
-        existing_val = existing_row[check_idx] if check_idx < len(existing_row) else ""
-        if existing_val in ("", None):
-            updates.append((row_num, row_values))
+        existing = {h: (existing_row[i] if i < len(existing_row) else "") for h, i in header_index.items()}
+        result = merge_row(existing, row_dict, compare_columns)
+        if result["changed"]:
+            merged = dict(existing)
+            merged.update(result["values"])
+            merged["last_updated"] = row_dict.get("last_updated", existing.get("last_updated", ""))
+            updates.append((row_num, ["" if merged.get(h) is None else merged.get(h) for h in headers]))
 
     if rows_to_append:
         worksheet.append_rows(rows_to_append, value_input_option="USER_ENTERED")
@@ -948,6 +1037,7 @@ def write_via_webapp(
     mode: Optional[str] = None,
     clear_before_write: bool = False,
     action: Optional[str] = None,
+    header_notes: Optional[Dict[str, str]] = None,
     timeout: Optional[float] = None,
     retries: int = 4,
     retry_delay: float = 5.0,
@@ -960,12 +1050,15 @@ def write_via_webapp(
     (pip install requests) in addition to this script's other dependencies.
 
     key_columns defaults to ["ticker", "quarter"] (every earnings table
-    uses this). mode defaults to None, which the receiver treats as
-    "finalize" (existing behavior: an existing row only updates while
-    finalize_column is still blank). Pass mode="overwrite" to always
-    replace an existing row regardless — used only by
-    write_progress_via_webapp() below, since a progress cursor needs to
-    be updated every checkpoint, not frozen after its first write.
+    uses this). mode="refresh" is what the four data tables use: the
+    receiver compares each existing row and rewrites it only if a value
+    changed, never blanking a value (see REFRESH_MODE). mode="overwrite"
+    always replaces an existing row (ScraperProgress, Raw_LastChecked).
+    mode=None is the receiver's older "finalize" behaviour (an existing
+    row only updates while finalize_column is still blank).
+
+    header_notes={column: text} puts a hover note on those header cells in
+    the sheet, e.g. what last_updated means.
 
     clear_before_write=True wipes all existing data rows in the target
     sheet (header kept) before applying `rows` — used only once, at the
@@ -1022,6 +1115,8 @@ def write_via_webapp(
         payload["mode"] = mode
     if clear_before_write:
         payload["clear_before_write"] = True
+    if header_notes:
+        payload["header_notes"] = header_notes
     if action:
         # Overrides the whole payload with just the action — used only by
         # trigger_sort_via_webapp() to send {"action": "sort_all"}, which
@@ -1183,6 +1278,18 @@ PROGRESS_HEADERS = [
 ISSUES_SHEET_NAME = "Raw_ScrapeIssues"
 ISSUES_HEADERS = ["ticker", "status", "detail", "run_date", "last_updated"]
 
+# Raw_LastChecked: one row per ticker, overwritten every time that ticker is
+# checked. It answers "is this data stale, or just unchanged?": since
+# last_updated in the data tabs only moves when a value CHANGES, a quiet
+# stock can show an old last_updated even though it was checked today.
+LAST_CHECKED_SHEET_NAME = "Raw_LastChecked"
+LAST_CHECKED_HEADERS = ["ticker", "last_checked", "result", "run_id"]
+LAST_CHECKED_NOTES = {
+    "last_checked": "When the scraper last read this ticker's Finviz page and saved the result.",
+    "result": ("OK = read and saved. NO_DATA = Finviz shows no earnings tables (e.g. ETFs). "
+               "FAILED = the page could not be read (details in Raw_ScrapeIssues)."),
+}
+
 
 def fetch_progress_via_webapp(
     web_app_url: str,
@@ -1238,7 +1345,7 @@ def write_progress_via_webapp(
     """Creates or updates THIS run's row in ScraperProgress (one row per
     workflow run — see the PROGRESS_HEADERS comment). mode="overwrite"
     (see finviz_data_receiver.gs) is what lets the same row be updated at
-    every checkpoint instead of the normal once-and-frozen upsert
+    every checkpoint instead of the compare-and-update ("refresh")
     behaviour the data tables use.
 
     Keyed on row_id, NOT run_date: run_date was once the key, and Google
@@ -1310,6 +1417,18 @@ def write_issues_via_webapp(
         web_app_url, sheet_name, ISSUES_HEADERS, rows,
         finalize_column=None, key_columns=["ticker"],
         clear_before_write=clear_first,
+    )
+
+
+def write_last_checked_via_webapp(web_app_url: str, checks: List[Dict]) -> None:
+    """Creates or updates one Raw_LastChecked row per ticker in `checks`
+    (dicts with LAST_CHECKED_HEADERS keys). mode="overwrite" because the row
+    must move on every check, like ScraperProgress."""
+    if not checks:
+        return
+    write_via_webapp(
+        web_app_url, LAST_CHECKED_SHEET_NAME, LAST_CHECKED_HEADERS, checks,
+        key_columns=["ticker"], mode="overwrite", header_notes=LAST_CHECKED_NOTES,
     )
 
 
@@ -1811,6 +1930,9 @@ def run_batch(
         "gaap_eps_appended": 0, "gaap_eps_updated": 0,
         "revenue_appended": 0, "revenue_updated": 0,
         "price_appended": 0, "price_updated": 0,
+        # Raw_DataFlags activity (see REFRESH_MODE): new problems found,
+        # and old ones Finviz has since fixed.
+        "flags_new": 0, "flags_resolved": 0,
         # Counts table writes that failed even after every retry. Not an
         # error condition for the run as a whole — see flush() — but it
         # must be surfaced at the end so a run that quietly lost several
@@ -1820,6 +1942,7 @@ def run_batch(
     ok_count = no_data_count = 0
     failed_tickers: List[str] = []
     batch_issues: List[tuple] = []  # (ticker, status, detail) since the last checkpoint
+    batch_checks: List[Dict] = []  # Raw_LastChecked rows since the last checkpoint
 
     batch_eps: List[Dict] = []
     batch_gaap_eps: List[Dict] = []
@@ -1855,12 +1978,13 @@ def run_batch(
                 # so the end-of-run summary states plainly how many
                 # checkpoint writes were lost. Rows missed this way are
                 # picked up on the next sweep anyway, because the upsert
-                # matches on ticker+quarter and unreported rows are never
-                # frozen. Losing one checkpoint's worth of re-derivable
+                # matches on ticker+quarter and every row Finviz still shows
+                # is compared again. Losing one checkpoint's worth of re-derivable
                 # rows is strictly better than losing hours of scraping.
-                def _write_table(label, headers, rows_, appended_key, updated_key, finalize):
+                def _write_table(label, headers, rows_, appended_key, updated_key):
                     try:
-                        r = write_via_webapp(web_app_url, label, headers, rows_, finalize_column=finalize)
+                        r = write_via_webapp(web_app_url, label, headers, rows_, mode=REFRESH_MODE,
+                                             header_notes=DATA_HEADER_NOTES)
                     except Exception as e:
                         totals["failed_writes"] += 1
                         print(f"  WARNING: {label} write FAILED after all retries ({e}). "
@@ -1868,26 +1992,32 @@ def run_batch(
                               f"re-collected on the next sweep. Continuing the run.")
                         return
                     totals[appended_key] += r["appended"]; totals[updated_key] += r["updated"]
-                    print(f"  {label}: +{r['appended']} new, {r['updated']} updated")
+                    totals["flags_new"] += r.get("flags_new", 0)
+                    totals["flags_resolved"] += r.get("flags_resolved", 0)
+                    flag_note = ""
+                    if r.get("flags_open") or r.get("flags_resolved"):
+                        flag_note = (f", {r.get('flags_open', 0)} flagged ({r.get('flags_new', 0)} new), "
+                                     f"{r.get('flags_resolved', 0)} flag(s) resolved")
+                    print(f"  {label}: +{r['appended']} new, {r['updated']} updated{flag_note}")
 
-                _write_table("Raw_EPSHistory", EPS_HEADERS, batch_eps, "eps_appended", "eps_updated", "reported")
-                _write_table("Raw_GAAPEPSHistory", GAAP_EPS_HEADERS, batch_gaap_eps, "gaap_eps_appended", "gaap_eps_updated", "reported")
-                _write_table("Raw_RevenueHistory", REVENUE_HEADERS, batch_revenue, "revenue_appended", "revenue_updated", "reported")
-                _write_table("Raw_PostEarningsMoves", PRICE_HEADERS, batch_price, "price_appended", "price_updated", PRICE_FINALIZE_COLUMN)
+                _write_table("Raw_EPSHistory", EPS_HEADERS, batch_eps, "eps_appended", "eps_updated")
+                _write_table("Raw_GAAPEPSHistory", GAAP_EPS_HEADERS, batch_gaap_eps, "gaap_eps_appended", "gaap_eps_updated")
+                _write_table("Raw_RevenueHistory", REVENUE_HEADERS, batch_revenue, "revenue_appended", "revenue_updated")
+                _write_table("Raw_PostEarningsMoves", PRICE_HEADERS, batch_price, "price_appended", "price_updated")
             else:
-                appended, updated = upsert_rows(eps_ws, batch_eps, finalize_column="reported")
+                appended, updated = upsert_rows(eps_ws, batch_eps)
                 totals["eps_appended"] += appended; totals["eps_updated"] += updated
                 print(f"  Raw_EPSHistory: +{appended} new, {updated} updated")
 
-                appended, updated = upsert_rows(gaap_eps_ws, batch_gaap_eps, finalize_column="reported")
+                appended, updated = upsert_rows(gaap_eps_ws, batch_gaap_eps)
                 totals["gaap_eps_appended"] += appended; totals["gaap_eps_updated"] += updated
                 print(f"  Raw_GAAPEPSHistory: +{appended} new, {updated} updated")
 
-                appended, updated = upsert_rows(revenue_ws, batch_revenue, finalize_column="reported")
+                appended, updated = upsert_rows(revenue_ws, batch_revenue)
                 totals["revenue_appended"] += appended; totals["revenue_updated"] += updated
                 print(f"  Raw_RevenueHistory: +{appended} new, {updated} updated")
 
-                appended, updated = upsert_rows(price_ws, batch_price, finalize_column=PRICE_FINALIZE_COLUMN)
+                appended, updated = upsert_rows(price_ws, batch_price)
                 totals["price_appended"] += appended; totals["price_updated"] += updated
                 print(f"  Raw_PostEarningsMoves: +{appended} new, {updated} updated")
 
@@ -1897,9 +2027,11 @@ def run_batch(
         """Flushes buffered rows, saves this run's progress row and records
         any scrape issues. Called every batch_size tickers, at the end of
         the run's list, and when the time budget runs out."""
-        nonlocal batch_issues
+        nonlocal batch_issues, batch_checks
+        failed_before = totals["failed_writes"]
         flush(desc)
         if not track_progress:
+            batch_checks = []
             return
         save_progress(done, last_ticker, status)
         saved["done"], saved["last_ticker"] = done, last_ticker
@@ -1911,6 +2043,16 @@ def run_batch(
                 print(f"  WARNING: could not save scrape issues ({e}). "
                       f"They're still visible in this console output above.")
             batch_issues = []
+        # "Checked" should mean "checked AND saved": if a table write in
+        # this checkpoint failed, these tickers are not marked as checked.
+        if batch_checks and totals["failed_writes"] == failed_before:
+            try:
+                write_last_checked_via_webapp(web_app_url, batch_checks)
+                print(f"  {LAST_CHECKED_SHEET_NAME}: marked {len(batch_checks)} ticker(s) as checked.")
+            except Exception as e:
+                print(f"  WARNING: could not update {LAST_CHECKED_SHEET_NAME} ({e}). "
+                      f"The data itself is saved; only the 'last checked' times are behind.")
+        batch_checks = []
 
     def _run_scrape_loop() -> str:
         """Returns the run's final status (see PROGRESS_HEADERS)."""
@@ -1926,6 +2068,7 @@ def run_batch(
 
             print(f"[{i + 1}/{len(tickers)}] Scraping {ticker}...")
             ticker_started = time.monotonic()
+            result = "FAILED"
             try:
                 data = scrape_ticker(ticker, headless=headless)
                 elapsed = time.monotonic() - ticker_started
@@ -1934,6 +2077,7 @@ def run_batch(
                 batch_revenue.extend(data["revenue"])
                 batch_price.extend(data["price_reaction"])
                 ok_count += 1
+                result = "OK"
                 print(
                     f"  OK ({elapsed:.1f}s): {len(data['eps'])} EPS, {len(data['gaap_eps'])} GAAP EPS, "
                     f"{len(data['revenue'])} Revenue, {len(data['price_reaction'])} PriceReaction quarters"
@@ -1941,6 +2085,7 @@ def run_batch(
             except NoFinancialsDataError as e:
                 elapsed = time.monotonic() - ticker_started
                 no_data_count += 1
+                result = "NO_DATA"
                 batch_issues.append((ticker, "NO_DATA", str(e)))
                 print(f"  NO DATA ({elapsed:.1f}s, expected for ETFs/unlisted tickers): {e}")
             except Exception as e:
@@ -1948,6 +2093,10 @@ def run_batch(
                 failed_tickers.append(ticker)
                 batch_issues.append((ticker, "FAILED", str(e)))
                 print(f"  FAILED ({elapsed:.1f}s, worth investigating): {e}")
+            batch_checks.append({
+                "ticker": ticker, "last_checked": datetime.now(timezone.utc).isoformat(),
+                "result": result, "run_id": run_id,
+            })
 
             is_last = i == len(tickers) - 1
             if is_last:
@@ -1992,6 +2141,9 @@ def run_batch(
             f"Revenue: +{totals['revenue_appended']} new/{totals['revenue_updated']} updated, "
             f"PriceReaction: +{totals['price_appended']} new/{totals['price_updated']} updated"
         )
+        if totals["flags_new"] or totals["flags_resolved"]:
+            print(f"Raw_DataFlags: {totals['flags_new']} new flag(s), "
+                  f"{totals['flags_resolved']} resolved this run.")
         if totals["failed_writes"]:
             print(
                 f"WARNING: {totals['failed_writes']} table write(s) failed after all retries during "
