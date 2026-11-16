@@ -71,14 +71,18 @@ import argparse
 import csv
 import os
 import re
+import signal
 import sys
+import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
@@ -89,6 +93,32 @@ class NoFinancialsDataError(Exception):
     """Raised when a ticker's page loads fine but has zero financials
     widgets on it — expected for ETFs (no earnings) and some OTC/unlisted
     tickers Finviz doesn't cover. Not a bug, and not worth retrying."""
+
+
+class TickerTimeLimitError(Exception):
+    """Raised when one ticker takes longer than TICKER_TIME_LIMIT_SECONDS.
+    Its browser has already been force-closed; the ticker counts as FAILED
+    and the run moves on to the next one. Not retried."""
+
+
+# HARD LIMITS (added 2026-11 after run #553 sat silent for 45 minutes until
+# GitHub's machine gave up). The 45-minute time budget is only checked
+# BETWEEN tickers, so on its own it cannot stop a ticker that hangs, or a
+# save that keeps waiting for the Apps Script.
+#
+# Per ticker: a normal ticker takes ~3-4 s; the slowest legitimate case
+# (three page-load attempts that each time out) is ~2.5 min. Past 3 min the
+# browser is force-closed and the ticker is marked FAILED.
+TICKER_TIME_LIMIT_SECONDS = 180
+# Per checkpoint save: all the writes of one checkpoint (four data tables,
+# progress, issues, last-checked) share this window. Each write still gets
+# at least one try of up to MIN_WRITE_TIMEOUT_SECONDS; retries only happen
+# while the window is open. Normally a whole save takes seconds; this only
+# matters when Google's Apps Script stops answering, where the old retry
+# limits alone allowed up to ~47 minutes. Rows that could not be saved are
+# collected again on the next sweep.
+CHECKPOINT_SAVE_LIMIT_SECONDS = 300
+MIN_WRITE_TIMEOUT_SECONDS = 30
 
 
 def load_env_file(path: str = ".env") -> None:
@@ -246,9 +276,77 @@ def get_driver(headless: bool = True) -> webdriver.Chrome:
     options.add_argument("--disable-dev-shm-usage")
     options.page_load_strategy = "eager"
 
-    driver = webdriver.Chrome(options=options)
+    # start_new_session: chromedriver (and the Chrome it starts) get their
+    # own process group, so force_close_browsers() can kill all of them at
+    # once if a ticker hangs. It changes nothing about how Chrome runs.
+    service = Service(popen_kw={"start_new_session": True})
+    _OPEN_BROWSER_SERVICES.append(service)
+    try:
+        driver = webdriver.Chrome(options=options, service=service)
+    except Exception:
+        # Chrome never started (Selenium already cleaned up): forget it.
+        if service in _OPEN_BROWSER_SERVICES:
+            _OPEN_BROWSER_SERVICES.remove(service)
+        raise
     driver.set_page_load_timeout(30)
     return driver
+
+
+# Browsers that are currently open (their chromedriver Service objects), so
+# a hung ticker's browser can be found and killed. fetch_html removes its
+# own entry after a normal close.
+_OPEN_BROWSER_SERVICES: List = []
+
+
+def force_close_browsers() -> int:
+    """Kills every browser still open (chromedriver plus the Chrome windows
+    it started) and returns how many were killed. Used only when a ticker
+    hits TICKER_TIME_LIMIT_SECONDS, when a polite driver.quit() could hang
+    too."""
+    killed = 0
+    while _OPEN_BROWSER_SERVICES:
+        process = getattr(_OPEN_BROWSER_SERVICES.pop(), "process", None)
+        if process is None or process.poll() is not None:
+            continue  # never started, or already gone
+        try:
+            os.killpg(process.pid, signal.SIGKILL)  # the whole group (Linux/macOS)
+        except (AttributeError, OSError):
+            try:
+                process.kill()  # fallback: at least chromedriver itself
+            except OSError:
+                continue
+        killed += 1
+    return killed
+
+
+@contextmanager
+def ticker_time_limit(seconds: Optional[float]):
+    """Runs the block with a hard time limit. When it runs out, every open
+    browser is force-closed and TickerTimeLimitError is raised inside the
+    block, wherever it is stuck (a page load, Chrome starting up, closing).
+
+    Uses the operating system's alarm signal, so it only works in the main
+    thread on Linux/macOS (GitHub's runners and your Mac). Anywhere else
+    (Windows, a background thread) the block simply runs without a limit."""
+    if (not seconds or not hasattr(signal, "SIGALRM")
+            or threading.current_thread() is not threading.main_thread()):
+        yield
+        return
+
+    def _on_time_up(signum, frame):
+        killed = force_close_browsers()
+        raise TickerTimeLimitError(
+            f"took longer than {seconds:g}s — browser force-closed "
+            f"({killed} browser(s) killed); counted as FAILED, run continues"
+        )
+
+    previous_handler = signal.signal(signal.SIGALRM, _on_time_up)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
 
 
 def fetch_html(ticker: str, headless: bool = True) -> str:
@@ -292,6 +390,9 @@ def fetch_html(ticker: str, headless: bool = True) -> str:
         return driver.page_source
     finally:
         driver.quit()
+        service = getattr(driver, "service", None)
+        if service in _OPEN_BROWSER_SERVICES:
+            _OPEN_BROWSER_SERVICES.remove(service)
 
 
 def fetch_html_with_retry(
@@ -305,8 +406,8 @@ def fetch_html_with_retry(
     for attempt in range(retries + 1):
         try:
             return fetch_html(ticker, headless=headless)
-        except NoFinancialsDataError:
-            raise
+        except (NoFinancialsDataError, TickerTimeLimitError):
+            raise  # retrying won't help, and a retry would escape the time limit
         except Exception as e:
             last_error = e
             if attempt < retries:
@@ -1041,6 +1142,7 @@ def write_via_webapp(
     timeout: Optional[float] = None,
     retries: int = 4,
     retry_delay: float = 5.0,
+    deadline: Optional[float] = None,
 ) -> Dict:
     """
     Alternative to upsert_rows() — sends rows to an Apps Script Web App
@@ -1059,6 +1161,11 @@ def write_via_webapp(
 
     header_notes={column: text} puts a hover note on those header cells in
     the sheet, e.g. what last_updated means.
+
+    deadline: a time.monotonic() value shared by all the writes of one
+    checkpoint (see CHECKPOINT_SAVE_LIMIT_SECONDS). The first attempt
+    always happens (with at least MIN_WRITE_TIMEOUT_SECONDS to answer);
+    retries only happen before the deadline. None = no deadline.
 
     clear_before_write=True wipes all existing data rows in the target
     sheet (header kept) before applying `rows` — used only once, at the
@@ -1126,8 +1233,12 @@ def write_via_webapp(
 
     last_error: Optional[Exception] = None
     for attempt in range(retries + 1):
+        attempt_timeout = timeout
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            attempt_timeout = max(min(timeout, remaining), MIN_WRITE_TIMEOUT_SECONDS)
         try:
-            resp = requests.post(web_app_url, json=payload, timeout=timeout)
+            resp = requests.post(web_app_url, json=payload, timeout=attempt_timeout)
             resp.raise_for_status()
             result = resp.json()
             if not result.get("ok"):
@@ -1148,6 +1259,13 @@ def write_via_webapp(
                 # same bad window. Backing off further gives it room to
                 # recover: 5s, 15s, 30s, 60s.
                 delay = retry_delay * (1, 3, 6, 12)[min(attempt, 3)]
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        print(f"  Write to {sheet_name!r} failed (attempt {attempt + 1}): {e} — this "
+                              f"checkpoint's save window is used up, so not retrying.")
+                        break
+                    delay = min(delay, remaining)
                 print(f"  Write to {sheet_name!r} failed (attempt {attempt + 1}/{retries + 1}): "
                       f"{e} — retrying in {delay:.0f}s...")
                 time.sleep(delay)
@@ -1341,6 +1459,7 @@ def write_progress_via_webapp(
     started_at: str = "",
     start_index: Optional[int] = None,
     status: str = "running",
+    deadline: Optional[float] = None,
 ) -> None:
     """Creates or updates THIS run's row in ScraperProgress (one row per
     workflow run — see the PROGRESS_HEADERS comment). mode="overwrite"
@@ -1368,7 +1487,7 @@ def write_progress_via_webapp(
     }
     write_via_webapp(
         web_app_url, sheet_name, PROGRESS_HEADERS, [row],
-        key_columns=["row_id"], mode="overwrite",
+        key_columns=["row_id"], mode="overwrite", deadline=deadline,
     )
 
 
@@ -1378,6 +1497,7 @@ def write_issues_via_webapp(
     run_date: str,
     clear_first: bool = False,
     sheet_name: str = ISSUES_SHEET_NAME,
+    deadline: Optional[float] = None,
 ) -> None:
     """
     Appends failed/no-data tickers found so far to Raw_ScrapeIssues — the
@@ -1416,11 +1536,12 @@ def write_issues_via_webapp(
     write_via_webapp(
         web_app_url, sheet_name, ISSUES_HEADERS, rows,
         finalize_column=None, key_columns=["ticker"],
-        clear_before_write=clear_first,
+        clear_before_write=clear_first, deadline=deadline,
     )
 
 
-def write_last_checked_via_webapp(web_app_url: str, checks: List[Dict]) -> None:
+def write_last_checked_via_webapp(web_app_url: str, checks: List[Dict],
+                                  deadline: Optional[float] = None) -> None:
     """Creates or updates one Raw_LastChecked row per ticker in `checks`
     (dicts with LAST_CHECKED_HEADERS keys). mode="overwrite" because the row
     must move on every check, like ScraperProgress."""
@@ -1429,6 +1550,7 @@ def write_last_checked_via_webapp(web_app_url: str, checks: List[Dict]) -> None:
     write_via_webapp(
         web_app_url, LAST_CHECKED_SHEET_NAME, LAST_CHECKED_HEADERS, checks,
         key_columns=["ticker"], mode="overwrite", header_notes=LAST_CHECKED_NOTES,
+        deadline=deadline,
     )
 
 
@@ -1887,7 +2009,8 @@ def run_batch(
     # "crashed" row never claims tickers whose data wasn't written.
     saved = {"done": 0, "last_ticker": ""}
 
-    def save_progress(done: int, last_ticker: str, status: str) -> None:
+    def save_progress(done: int, last_ticker: str, status: str,
+                      deadline: Optional[float] = None) -> None:
         """Writes this run's ScraperProgress row. Never raises: a progress
         hiccup must not take down a run whose data is already written."""
         absolute_next_index = resume_offset + done
@@ -1895,7 +2018,7 @@ def run_batch(
             write_progress_via_webapp(
                 web_app_url, absolute_next_index, total_universe, run_date, last_ticker,
                 sheet_name=progress_sheet_name, run_id=run_id, started_at=started_at,
-                start_index=resume_offset, status=status,
+                start_index=resume_offset, status=status, deadline=deadline,
             )
             print(f"  Progress saved: {absolute_next_index}/{total_universe} tickers done this sweep "
                   f"(last: {last_ticker or '-'}, status: {status}, row: {run_id}).")
@@ -1949,10 +2072,11 @@ def run_batch(
     batch_revenue: List[Dict] = []
     batch_price: List[Dict] = []
 
-    def flush(checkpoint_desc: str) -> None:
+    def flush(checkpoint_desc: str, deadline: Optional[float] = None) -> None:
         """Writes whatever's currently in the batch buffers to local CSV
         (always) and to Sheets (if configured), then clears the buffers.
-        Safe to call with empty buffers."""
+        Safe to call with empty buffers. `deadline`: see
+        CHECKPOINT_SAVE_LIMIT_SECONDS."""
         nonlocal batch_eps, batch_gaap_eps, batch_revenue, batch_price
 
         print(f"\n--- Checkpoint: {checkpoint_desc} ---")
@@ -1984,7 +2108,7 @@ def run_batch(
                 def _write_table(label, headers, rows_, appended_key, updated_key):
                     try:
                         r = write_via_webapp(web_app_url, label, headers, rows_, mode=REFRESH_MODE,
-                                             header_notes=DATA_HEADER_NOTES)
+                                             header_notes=DATA_HEADER_NOTES, deadline=deadline)
                     except Exception as e:
                         totals["failed_writes"] += 1
                         print(f"  WARNING: {label} write FAILED after all retries ({e}). "
@@ -2029,15 +2153,18 @@ def run_batch(
         the run's list, and when the time budget runs out."""
         nonlocal batch_issues, batch_checks
         failed_before = totals["failed_writes"]
-        flush(desc)
+        # One save window for everything this checkpoint writes.
+        deadline = time.monotonic() + CHECKPOINT_SAVE_LIMIT_SECONDS
+        flush(desc, deadline)
         if not track_progress:
             batch_checks = []
             return
-        save_progress(done, last_ticker, status)
+        save_progress(done, last_ticker, status, deadline)
         saved["done"], saved["last_ticker"] = done, last_ticker
         if batch_issues:
             try:
-                write_issues_via_webapp(web_app_url, batch_issues, run_date, clear_first=False)
+                write_issues_via_webapp(web_app_url, batch_issues, run_date, clear_first=False,
+                                        deadline=deadline)
                 print(f"  {ISSUES_SHEET_NAME}: recorded {len(batch_issues)} issue(s) from this batch.")
             except Exception as e:
                 print(f"  WARNING: could not save scrape issues ({e}). "
@@ -2047,7 +2174,7 @@ def run_batch(
         # this checkpoint failed, these tickers are not marked as checked.
         if batch_checks and totals["failed_writes"] == failed_before:
             try:
-                write_last_checked_via_webapp(web_app_url, batch_checks)
+                write_last_checked_via_webapp(web_app_url, batch_checks, deadline=deadline)
                 print(f"  {LAST_CHECKED_SHEET_NAME}: marked {len(batch_checks)} ticker(s) as checked.")
             except Exception as e:
                 print(f"  WARNING: could not update {LAST_CHECKED_SHEET_NAME} ({e}). "
@@ -2070,7 +2197,11 @@ def run_batch(
             ticker_started = time.monotonic()
             result = "FAILED"
             try:
-                data = scrape_ticker(ticker, headless=headless)
+                # Hard limit per ticker: see TICKER_TIME_LIMIT_SECONDS. If it
+                # runs out, TickerTimeLimitError lands in "except Exception"
+                # below like any other failure: FAILED, then the next ticker.
+                with ticker_time_limit(TICKER_TIME_LIMIT_SECONDS):
+                    data = scrape_ticker(ticker, headless=headless)
                 elapsed = time.monotonic() - ticker_started
                 batch_eps.extend(data["eps"])
                 batch_gaap_eps.extend(data["gaap_eps"])

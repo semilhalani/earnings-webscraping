@@ -7,3 +7,9 @@
 # to our code. Upgrading is a deliberate, one-line change here.
 pytest==9.1.1
 ruff==0.16.9
+# actionlint checks the GitHub workflow files (.github/workflows/*.yml) for
+# mistakes before they ever run. shellcheck is what it uses to check the
+# shell commands inside them; pinning it here means your laptop and CI run
+# the same check (GitHub's machines also have their own copy).
+actionlint-py==1.7.12.25
+shellcheck-py==0.11.0.1

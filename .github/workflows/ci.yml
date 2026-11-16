@@ -24,18 +24,20 @@ jobs:
   # more steps in this SAME job, so the name (and the protection) stays.
   checks:
     # A fresh, temporary Ubuntu Linux machine from GitHub, wiped afterwards.
-    runs-on: ubuntu-latest
+    # A fixed Ubuntu version, not "ubuntu-latest", so GitHub moving "latest"
+    # to a new release can't change our checks without us choosing it.
+    runs-on: ubuntu-24.04
     # Lint and tests take seconds; anything near 10 minutes means something hung.
     timeout-minutes: 10
 
     steps:
       # 1. Copy this commit's code onto the machine (it starts empty).
       - name: Check out the code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # 2. Install Python 3.11, the same version the scraper runs on.
       - name: Set up Python 3.11
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
@@ -51,6 +53,12 @@ jobs:
       #    it exits with an error, this step fails, and the run shows a red X.
       - name: Lint with ruff
         run: ruff check .
+
+      # 4b. Lint the workflow files themselves (this file and
+      #     scrape-earnings.yml), including the shell commands inside them.
+      #     Without this, a typo in a workflow is only found when it runs.
+      - name: Lint the workflow files with actionlint
+        run: actionlint
 
       # 5. Tests: pytest runs every test_ function in the tests/ folder.
       #    If any assert fails, pytest exits with an error and the run is red.
